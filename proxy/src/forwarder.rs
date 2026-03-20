@@ -6,7 +6,7 @@ use std::{
         Arc, RwLock,
     },
     thread::{Builder, JoinHandle},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
@@ -77,7 +77,8 @@ pub fn start_forwarder_threads(
         panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
     });
 
-    let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
+    let (reconstruct_tx, reconstruct_rx) =
+        crossbeam_channel::bounded::<(Instant, PacketBatch)>(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
 
     if should_reconstruct_shreds {
@@ -102,7 +103,7 @@ pub fn start_forwarder_threads(
 
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(pkt_batch) => {
+                        Ok((t0, pkt_batch)) => {
                             deshred::reconstruct_shreds(
                                 pkt_batch,
                                 &mut all_shreds,
@@ -113,11 +114,24 @@ pub fn start_forwarder_threads(
                                 &metrics,
                             );
 
+                            // Compute producer timestamp from T0 (Instant) by offsetting SystemTime
+                            let producer_timestamp_nanos = if !deshredded_entries.is_empty() {
+                                let elapsed_since_t0 = t0.elapsed();
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .saturating_sub(elapsed_since_t0)
+                                    .as_nanos() as u64
+                            } else {
+                                0
+                            };
+
                             deshredded_entries.drain(..).for_each(
                                 |(slot, _entries, entries_bytes)| {
                                     let _ = entry_sender.send(PbEntry {
                                         slot,
                                         entries: entries_bytes,
+                                        producer_timestamp_nanos,
                                     });
                                 },
                             );
@@ -221,7 +235,7 @@ fn recv_from_channel_and_send_multiple_dest(
     send_socket: &UdpSocket,
     local_dest_sockets: &[SocketAddr],
     should_reconstruct_shreds: bool,
-    reconstruct_tx: &crossbeam_channel::Sender<PacketBatch>,
+    reconstruct_tx: &crossbeam_channel::Sender<(Instant, PacketBatch)>,
     debug_trace_shred: bool,
     metrics: &ShredMetrics,
 ) -> Result<(), ShredstreamProxyError> {
@@ -237,7 +251,7 @@ fn recv_from_channel_and_send_multiple_dest(
     );
 
     if should_reconstruct_shreds {
-        let _ = reconstruct_tx.try_send(packet_batch.clone());
+        let _ = reconstruct_tx.try_send((Instant::now(), packet_batch.clone()));
     }
 
     let mut packet_batch_vec = vec![packet_batch];
@@ -682,7 +696,8 @@ mod tests {
                 thread::spawn(move || listen_and_collect(socket, to_receive));
             });
 
-        let (reconstruct_tx, _reconstruct_rx) = crossbeam_channel::bounded(10_240);
+        let (reconstruct_tx, _reconstruct_rx) =
+            crossbeam_channel::bounded::<(std::time::Instant, PacketBatch)>(10_240);
         // send packets
         recv_from_channel_and_send_multiple_dest(
             packet_receiver.recv(),

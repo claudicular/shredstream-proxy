@@ -22,11 +22,24 @@ async fn main() -> Result<(), std::io::Error> {
                     continue;
                 }
             };
+
+        let latency_str = if slot_entry.producer_timestamp_nanos > 0 {
+            let now_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            let latency_us = now_nanos.saturating_sub(slot_entry.producer_timestamp_nanos) / 1_000;
+            format!(", pipeline_latency: {latency_us}us")
+        } else {
+            String::new()
+        };
+
         println!(
-            "slot {}, entries: {}, transactions: {}",
+            "slot {}, entries: {}, transactions: {}{}",
             slot_entry.slot,
             entries.len(),
-            entries.iter().map(|e| e.transactions.len()).sum::<usize>()
+            entries.iter().map(|e| e.transactions.len()).sum::<usize>(),
+            latency_str
         );
     }
     Ok(())
