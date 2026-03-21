@@ -58,6 +58,7 @@ pub fn start_forwarder_threads(
     use_discovery_service: bool,
     forward_stats: Arc<StreamerReceiveStats>,
     metrics: Arc<ShredMetrics>,
+    reconstructor_core_id: Option<usize>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
@@ -88,6 +89,23 @@ pub fn start_forwarder_threads(
         let hdl = std::thread::Builder::new()
             .name("shred_reconstructor".to_string())
             .spawn(move || {
+                // Pin to a specific core if configured
+                if let Some(_core_id) = reconstructor_core_id {
+                    #[cfg(target_os = "linux")]
+                    let core_id = _core_id;
+                    #[cfg(target_os = "linux")]
+                    unsafe {
+                        let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
+                        libc::CPU_SET(core_id, &mut cpuset);
+                        let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
+                        if ret == 0 {
+                            info!("Pinned reconstructor thread to core {core_id}");
+                        } else {
+                            warn!("Failed to pin reconstructor thread to core {core_id}: {}", std::io::Error::last_os_error());
+                        }
+                    }
+                }
+
                 let mut all_shreds = ahash::HashMap::<
                     Slot,
                     (

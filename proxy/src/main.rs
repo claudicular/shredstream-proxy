@@ -136,6 +136,11 @@ struct CommonArgs {
     #[arg(long, env)]
     grpc_service_port: Option<u16>,
 
+    /// Pin the reconstructor thread to this CPU core (0-indexed).
+    /// Reduces tail latency from OS scheduler jitter.
+    #[arg(long, env)]
+    reconstructor_core_id: Option<usize>,
+
     /// Public IP address to use.
     /// Overrides value fetched from `ifconfig.me`.
     #[arg(long, env)]
@@ -309,6 +314,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         use_discovery_service,
         forward_stats.clone(),
         metrics.clone(),
+        args.reconstructor_core_id,
         shutdown_receiver.clone(),
         exit.clone(),
     );
