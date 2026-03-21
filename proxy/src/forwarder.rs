@@ -127,6 +127,7 @@ pub fn start_forwarder_threads(
 
                 // Track max processing time of batches that don't produce entries
                 let mut max_noentry_reconstruct_us: u64 = 0;
+                let mut window_max_noentry_reconstruct_us: u64 = 0;
 
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.try_recv() {
@@ -181,6 +182,8 @@ pub fn start_forwarder_threads(
                             } else {
                                 max_noentry_reconstruct_us =
                                     max_noentry_reconstruct_us.max(reconstruct_us);
+                                window_max_noentry_reconstruct_us =
+                                    window_max_noentry_reconstruct_us.max(reconstruct_us);
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -209,7 +212,7 @@ pub fn start_forwarder_threads(
                             fec p50={}us p99={}us max={}us | \
                             deshred p50={}us p99={}us max={}us | \
                             total p50={}us p99={}us max={}us",
-                            max_noentry_reconstruct_us,
+                            window_max_noentry_reconstruct_us,
                             pct(&transit, 50), pct(&transit, 99), transit.last().unwrap(),
                             pct(&ingest, 50), pct(&ingest, 99), ingest.last().unwrap(),
                             pct(&fec, 50), pct(&fec, 99), fec.last().unwrap(),
@@ -218,6 +221,7 @@ pub fn start_forwarder_threads(
                         );
 
                         timing_samples.clear();
+                        window_max_noentry_reconstruct_us = 0;
                         last_report = Instant::now();
                     }
                 }
