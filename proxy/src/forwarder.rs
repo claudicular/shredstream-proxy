@@ -78,7 +78,7 @@ pub fn start_forwarder_threads(
     });
 
     let (reconstruct_tx, reconstruct_rx) =
-        crossbeam_channel::bounded::<(Instant, PacketBatch)>(1_024);
+        crossbeam_channel::bounded::<(Instant, Arc<PacketBatch>)>(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
 
     if should_reconstruct_shreds {
@@ -95,6 +95,7 @@ pub fn start_forwarder_threads(
                         ShredsStateTracker,
                     ),
                 >::default();
+                let mut tracker_pool = Vec::<ShredsStateTracker>::new();
                 let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
                 let mut deshredded_entries =
                     Vec::<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>::new();
@@ -105,8 +106,9 @@ pub fn start_forwarder_threads(
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok((t0, pkt_batch)) => {
                             deshred::reconstruct_shreds(
-                                pkt_batch,
+                                &pkt_batch,
                                 &mut all_shreds,
+                                &mut tracker_pool,
                                 &mut slot_fec_indexes_to_iterate,
                                 &mut deshredded_entries,
                                 &mut highest_slot_seen,
@@ -235,7 +237,7 @@ fn recv_from_channel_and_send_multiple_dest(
     send_socket: &UdpSocket,
     local_dest_sockets: &[SocketAddr],
     should_reconstruct_shreds: bool,
-    reconstruct_tx: &crossbeam_channel::Sender<(Instant, PacketBatch)>,
+    reconstruct_tx: &crossbeam_channel::Sender<(Instant, Arc<PacketBatch>)>,
     debug_trace_shred: bool,
     metrics: &ShredMetrics,
 ) -> Result<(), ShredstreamProxyError> {
@@ -250,38 +252,43 @@ fn recv_from_channel_and_send_multiple_dest(
         packet_batch.iter().map(|x| x.meta().size).sum::<usize>()
     );
 
-    if should_reconstruct_shreds {
-        let _ = reconstruct_tx.try_send((Instant::now(), packet_batch.clone()));
-    }
+    // Capture T0 as early as possible for pipeline latency measurement
+    let t0 = Instant::now();
 
+    // Dedup first (only mutation needed), then wrap in Arc to share with reconstructor
     let mut packet_batch_vec = vec![packet_batch];
-
     let num_deduped = solana_perf::deduper::dedup_packets_and_count_discards(
         &deduper.read().unwrap(),
         &mut packet_batch_vec,
     );
-    // Store stats for each Packet
-    packet_batch_vec.iter().for_each(|batch| {
-        batch.iter().for_each(|packet| {
-            metrics
-                .packets_received
-                .entry(packet.meta().addr)
-                .and_modify(|(discarded, not_discarded)| {
-                    *discarded += packet.meta().discard() as u64;
-                    *not_discarded += (!packet.meta().discard()) as u64;
-                })
-                .or_insert_with(|| {
-                    (
-                        packet.meta().discard() as u64,
-                        (!packet.meta().discard()) as u64,
-                    )
-                });
-        });
+
+    // Collect per-packet metrics from dedup flags
+    packet_batch_vec[0].iter().for_each(|packet| {
+        metrics
+            .packets_received
+            .entry(packet.meta().addr)
+            .and_modify(|(discarded, not_discarded)| {
+                *discarded += packet.meta().discard() as u64;
+                *not_discarded += (!packet.meta().discard()) as u64;
+            })
+            .or_insert_with(|| {
+                (
+                    packet.meta().discard() as u64,
+                    (!packet.meta().discard()) as u64,
+                )
+            });
     });
+
+    // Done mutating — wrap in Arc for zero-copy sharing with reconstructor
+    let packet_batch = Arc::new(packet_batch_vec.pop().unwrap());
+
+    if should_reconstruct_shreds {
+        let _ = reconstruct_tx.try_send((t0, Arc::clone(&packet_batch)));
+    }
 
     // send out to RPCs
     local_dest_sockets.iter().for_each(|outgoing_socketaddr| {
-        let packets_with_dest = packet_batch_vec[0]
+        let packets_with_dest = packet_batch
             .iter()
             .filter_map(|pkt| {
                 let data = pkt.data(..)?;
@@ -315,7 +322,7 @@ fn recv_from_channel_and_send_multiple_dest(
 
     // Count TraceShred shreds
     if debug_trace_shred {
-        packet_batch_vec[0]
+        packet_batch
             .iter()
             .filter_map(|p| TraceShred::decode(p.data(..)?).ok())
             .filter(|t| t.created_at.is_some())
@@ -697,7 +704,7 @@ mod tests {
             });
 
         let (reconstruct_tx, _reconstruct_rx) =
-            crossbeam_channel::bounded::<(std::time::Instant, PacketBatch)>(10_240);
+            crossbeam_channel::bounded::<(std::time::Instant, Arc<PacketBatch>)>(10_240);
         // send packets
         recv_from_channel_and_send_multiple_dest(
             packet_receiver.recv(),

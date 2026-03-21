@@ -51,13 +51,23 @@ impl Default for ShredsStateTracker {
     }
 }
 
+impl ShredsStateTracker {
+    /// Reset all fields to default values without deallocating the underlying Vecs.
+    fn clear(&mut self) {
+        self.data_status.fill(ShredStatus::Unknown);
+        self.data_shreds.fill(None);
+        self.already_recovered_fec_sets.fill(false);
+        self.already_deshredded.fill(false);
+    }
+}
+
 /// Returns the number of shreds reconstructed
 /// Updates all_shreds with current state, and deshredded_entries with returned values
 /// receive shreds per FEC set, attempting to recover the other shreds in the fec set so you do not have to wait until all data shreds have arrived.
 /// every time a fec is recovered, scan for neighbouring DATA_COMPLETE_SHRED flags in the shreds, attempting to deserialize into solana entries when there are no missing shreds between the DATA_COMPLETE_SHRED flags.
 /// note that an FEC set doesn't necessarily contain DATA_COMPLETE_SHRED in the last shred. when deserializing the bincode data, you must use data between shreds starting at the last DATA_COMPLETE_SHRED (not inclusive) to the next DATA_COMPLETE_SHRED (inclusive)
 pub fn reconstruct_shreds(
-    packet_batch: PacketBatch,
+    packet_batch: &PacketBatch,
     all_shreds: &mut ahash::HashMap<
         Slot,
         (
@@ -65,6 +75,7 @@ pub fn reconstruct_shreds(
             ShredsStateTracker,
         ),
     >,
+    tracker_pool: &mut Vec<ShredsStateTracker>,
     slot_fec_indexes_to_iterate: &mut Vec<(Slot, u32)>,
     deshredded_entries: &mut Vec<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>,
     highest_slot_seen: &mut Slot,
@@ -82,7 +93,12 @@ pub fn reconstruct_shreds(
                 let slot = shred.common_header().slot;
                 let index = shred.index() as usize;
                 let fec_set_index = shred.fec_set_index();
-                let (all_shreds, state_tracker) = all_shreds.entry(slot).or_default();
+                let (all_shreds, state_tracker) = all_shreds
+                    .entry(slot)
+                    .or_insert_with(|| {
+                        let tracker = tracker_pool.pop().unwrap_or_default();
+                        (ahash::HashMap::default(), tracker)
+                    });
                 if highest_slot_seen.saturating_sub(SLOT_LOOKBACK) > slot {
                     debug!(
                         "Old shred slot: {slot}, fec_set_index: {fec_set_index}, index: {index}"
@@ -257,10 +273,16 @@ pub fn reconstruct_shreds(
         let slot_threshold = highest_slot_seen.saturating_sub(SLOT_LOOKBACK);
         let mut incomplete_fec_sets = ahash::HashMap::<Slot, Vec<_>>::default();
         let mut incomplete_fec_sets_count = 0;
-        all_shreds.retain(|slot, (fec_set_indexes, state_tracker)| {
-            if *slot >= slot_threshold {
-                return true;
-            }
+
+        // Collect slots to evict, then remove them so we can recycle trackers
+        let slots_to_evict: Vec<Slot> = all_shreds
+            .keys()
+            .filter(|slot| **slot < slot_threshold)
+            .copied()
+            .collect();
+
+        for slot in slots_to_evict {
+            let (fec_set_indexes, mut state_tracker) = all_shreds.remove(&slot).unwrap();
 
             // count missing fec sets before clearing
             for (fec_set_index, shreds) in fec_set_indexes.iter() {
@@ -276,7 +298,7 @@ pub fn reconstruct_shreds(
 
                 incomplete_fec_sets_count += 1;
                 incomplete_fec_sets
-                    .entry(*slot)
+                    .entry(slot)
                     .and_modify(|fec_set_data| {
                         fec_set_data.push((*fec_set_index, num_expected_data_shreds, shreds.len()))
                     })
@@ -285,8 +307,12 @@ pub fn reconstruct_shreds(
                     });
             }
 
-            false
-        });
+            // Recycle tracker to pool instead of dropping (cap to avoid unbounded growth)
+            if tracker_pool.len() < 16 {
+                state_tracker.clear();
+                tracker_pool.push(state_tracker);
+            }
+        }
         if incomplete_fec_sets_count > 0 {
             incomplete_fec_sets
                 .iter_mut()
@@ -671,11 +697,12 @@ mod tests {
 
         // Test 1: all shreds provided
         let mut all_shreds = ahash::HashMap::default();
+        let mut tracker_pool = Vec::new();
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
         let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
+            &PacketBatch::new(
                 packets
                     .packets
                     .iter()
@@ -688,6 +715,7 @@ mod tests {
                     .collect_vec(),
             ),
             &mut all_shreds,
+            &mut tracker_pool,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
             &mut highest_slot_seen,
@@ -726,11 +754,12 @@ mod tests {
 
         // Test 2: 33% of shreds missing
         let mut all_shreds = ahash::HashMap::default();
+        let mut tracker_pool = Vec::new();
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
         let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
+            &PacketBatch::new(
                 packets
                     .packets
                     .iter()
@@ -745,6 +774,7 @@ mod tests {
                     .collect_vec(),
             ),
             &mut all_shreds,
+            &mut tracker_pool,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
             &mut highest_slot_seen,
@@ -848,11 +878,12 @@ mod tests {
 
         // Test 1: all shreds provided
         let mut all_shreds = ahash::HashMap::default();
+        let mut tracker_pool = Vec::new();
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
         let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
+            &PacketBatch::new(
                 packets
                     .packets
                     .iter()
@@ -865,6 +896,7 @@ mod tests {
                     .collect_vec(),
             ),
             &mut all_shreds,
+            &mut tracker_pool,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
             &mut highest_slot_seen,
@@ -903,11 +935,12 @@ mod tests {
 
         // Test 2: 33% of shreds missing
         let mut all_shreds = ahash::HashMap::default();
+        let mut tracker_pool = Vec::new();
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
         let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
+            &PacketBatch::new(
                 packets
                     .packets
                     .iter()
@@ -922,6 +955,7 @@ mod tests {
                     .collect_vec(),
             ),
             &mut all_shreds,
+            &mut tracker_pool,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
             &mut highest_slot_seen,
@@ -1004,12 +1038,14 @@ mod tests {
 
         // Test 1: all shreds provided
         let mut all_shreds = ahash::HashMap::default();
+        let mut tracker_pool = Vec::new();
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
         let recovered_count = reconstruct_shreds(
-            PacketBatch::new(packets.clone()),
+            &PacketBatch::new(packets.clone()),
             &mut all_shreds,
+            &mut tracker_pool,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
             &mut highest_slot_seen,
@@ -1031,11 +1067,12 @@ mod tests {
 
         // Test 2: 33% of shreds missing
         let mut all_shreds = ahash::HashMap::default();
+        let mut tracker_pool = Vec::new();
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
         let recovered_count = reconstruct_shreds(
-            PacketBatch::new(
+            &PacketBatch::new(
                 packets
                     .iter()
                     .enumerate()
@@ -1044,6 +1081,7 @@ mod tests {
                     .collect(),
             ),
             &mut all_shreds,
+            &mut tracker_pool,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
             &mut highest_slot_seen,
