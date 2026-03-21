@@ -28,7 +28,7 @@ use solana_perf::{
 use solana_sdk::clock::Slot;
 use solana_streamer::{
     sendmmsg::{batch_send, SendPktsError},
-    streamer::{self, StreamerReceiveStats},
+    streamer::StreamerReceiveStats,
 };
 use tokio::sync::broadcast::Sender;
 
@@ -65,7 +65,7 @@ pub fn start_forwarder_threads(
     let num_threads = num_threads
         .unwrap_or_else(|| usize::from(std::thread::available_parallelism().unwrap()).min(4));
 
-    let recycler: PacketBatchRecycler = Recycler::warmed(100, 1024);
+    let _recycler: PacketBatchRecycler = Recycler::warmed(100, 1024);
 
     // multi_bind_in_range returns (port, Vec<UdpSocket>)
     let (_port, sockets) = solana_net_utils::multi_bind_in_range_with_config(
@@ -243,18 +243,14 @@ pub fn start_forwarder_threads(
         .chain(maybe_multicast_socket.into_iter().flatten())
         .enumerate()
         .flat_map(|(thread_id, incoming_shred_socket)| {
-            let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
-            let listen_thread = streamer::receiver(
+            let (packet_sender, packet_receiver) =
+                crossbeam_channel::unbounded::<(i64, PacketBatch)>();
+            let listen_thread = crate::recv_timestamp::start_recv_thread(
                 format!("ssListen{thread_id}"),
                 Arc::new(incoming_shred_socket),
                 exit.clone(),
                 packet_sender,
-                recycler.clone(),
                 forward_stats.clone(),
-                Duration::default(),
-                false,
-                None,
-                false,
             );
 
             let deduper = deduper.clone();
@@ -281,9 +277,14 @@ pub fn start_forwarder_threads(
                     while !exit.load(Ordering::Relaxed) {
                         crossbeam_channel::select! {
                             // forward packets
-                            recv(packet_receiver) -> maybe_packet_batch => {
+                            recv(packet_receiver) -> maybe_ts_batch => {
+                                let (kernel_ts_nanos, maybe_packet_batch) = match maybe_ts_batch {
+                                    Ok((ts, batch)) => (ts, Ok(batch)),
+                                    Err(e) => (0, Err(e)),
+                                };
                                 let res = recv_from_channel_and_send_multiple_dest(
                                     maybe_packet_batch,
+                                    kernel_ts_nanos,
                                     &deduper,
                                     &send_socket,
                                     &local_dest_sockets,
@@ -324,6 +325,7 @@ pub fn start_forwarder_threads(
 #[allow(clippy::too_many_arguments)]
 fn recv_from_channel_and_send_multiple_dest(
     maybe_packet_batch: Result<PacketBatch, RecvError>,
+    kernel_ts_nanos: i64,
     deduper: &RwLock<Deduper<2, [u8]>>,
     send_socket: &UdpSocket,
     local_dest_sockets: &[SocketAddr],
@@ -345,6 +347,26 @@ fn recv_from_channel_and_send_multiple_dest(
 
     // Capture T0 as early as possible for pipeline latency measurement
     let t0 = Instant::now();
+
+    // Compute kernel-to-forwarder latency (NIC → kernel → streamer → channel → here)
+    if kernel_ts_nanos > 0 {
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let kernel_to_forwarder_us = (now_nanos - kernel_ts_nanos) / 1_000;
+        if kernel_to_forwarder_us > 0 {
+            metrics
+                .kernel_to_forwarder_us_sum
+                .fetch_add(kernel_to_forwarder_us as u64, Ordering::Relaxed);
+            metrics
+                .kernel_to_forwarder_us_count
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .kernel_to_forwarder_us_max
+                .fetch_max(kernel_to_forwarder_us as u64, Ordering::Relaxed);
+        }
+    }
 
     // Dedup first (only mutation needed), then wrap in Arc to share with reconstructor
     let mut packet_batch_vec = vec![packet_batch];
@@ -593,6 +615,11 @@ pub struct ShredMetrics {
     /// Number of times we couldn't find the previous DATA_COMPLETE_SHRED flag but tried to deshred+deserialize, and failed
     pub unknown_start_position_error_count: AtomicU64,
 
+    // kernel-to-forwarder latency (SO_TIMESTAMPNS)
+    pub kernel_to_forwarder_us_sum: AtomicU64,
+    pub kernel_to_forwarder_us_count: AtomicU64,
+    pub kernel_to_forwarder_us_max: AtomicU64,
+
     // cumulative metrics (persist after reset)
     pub agg_received_cumulative: AtomicU64,
     pub agg_success_forward_cumulative: AtomicU64,
@@ -622,6 +649,9 @@ impl ShredMetrics {
             fec_recovery_error_count: Default::default(),
             bincode_deserialize_error_count: Default::default(),
             unknown_start_position_error_count: Default::default(),
+            kernel_to_forwarder_us_sum: Default::default(),
+            kernel_to_forwarder_us_count: Default::default(),
+            kernel_to_forwarder_us_max: Default::default(),
             agg_received_cumulative: Default::default(),
             agg_success_forward_cumulative: Default::default(),
             agg_fail_forward_cumulative: Default::default(),
@@ -682,6 +712,19 @@ impl ShredMetrics {
                         .swap(0, Ordering::Relaxed),
                     i64
                 ),
+            );
+        }
+
+        // Report kernel-to-forwarder latency from SO_TIMESTAMPNS
+        let k2f_count = self.kernel_to_forwarder_us_count.swap(0, Ordering::Relaxed);
+        if k2f_count > 0 {
+            let k2f_sum = self.kernel_to_forwarder_us_sum.swap(0, Ordering::Relaxed);
+            let k2f_max = self.kernel_to_forwarder_us_max.swap(0, Ordering::Relaxed);
+            info!(
+                "kernel_to_forwarder: avg={}us max={}us count={}",
+                k2f_sum / k2f_count,
+                k2f_max,
+                k2f_count,
             );
         }
 
@@ -799,6 +842,7 @@ mod tests {
         // send packets
         recv_from_channel_and_send_multiple_dest(
             packet_receiver.recv(),
+            0, // no kernel timestamp in test
             &Arc::new(RwLock::new(Deduper::<2, [u8]>::new(
                 &mut rand::thread_rng(),
                 crate::forwarder::DEDUPER_NUM_BITS,
