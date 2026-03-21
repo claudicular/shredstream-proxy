@@ -2,7 +2,7 @@ use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering, time::Instan
 
 use itertools::Itertools;
 use jito_protos::shredstream::TraceShred;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use prost::Message;
 use solana_ledger::{
     blockstore::MAX_DATA_SHREDS_PER_SLOT,
@@ -274,7 +274,7 @@ pub fn reconstruct_shreds(
     let t_deshredded = Instant::now();
 
     if !deshredded_entries.is_empty() {
-        debug!(
+        info!(
             "pipeline_stages: ingest={}us fec_recovery={}us deshred={}us total={}us entries={}",
             t_ingested.duration_since(t_start).as_micros(),
             t_recovered.duration_since(t_ingested).as_micros(),

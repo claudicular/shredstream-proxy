@@ -118,7 +118,7 @@ pub fn start_forwarder_threads(
                             );
 
                             if !deshredded_entries.is_empty() {
-                                debug!(
+                                info!(
                                     "pipeline_channel: transit={}us reconstruct={}us total={}us",
                                     t_recv.duration_since(t0).as_micros(),
                                     t_recv.elapsed().as_micros(),
