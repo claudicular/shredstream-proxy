@@ -121,7 +121,7 @@ pub fn start_forwarder_threads(
                 let rs_cache = ReedSolomonCache::default();
 
                 // Accumulate per-stage timings for periodic pxx reporting
-                let mut timing_samples: Vec<[u64; 5]> = Vec::with_capacity(1024);
+                let mut timing_samples: Vec<[u64; 6]> = Vec::with_capacity(1024);
                 let mut last_report = Instant::now();
                 const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -161,6 +161,7 @@ pub fn start_forwarder_threads(
                                     stage_timing.ingest_us,
                                     stage_timing.fec_recovery_us,
                                     stage_timing.deshred_us,
+                                    stage_timing.eviction_us,
                                     total_us,
                                 ]);
 
@@ -197,9 +198,10 @@ pub fn start_forwarder_threads(
                         let mut ingest: Vec<u64> = timing_samples.iter().map(|s| s[1]).collect();
                         let mut fec: Vec<u64> = timing_samples.iter().map(|s| s[2]).collect();
                         let mut deshred: Vec<u64> = timing_samples.iter().map(|s| s[3]).collect();
-                        let mut total: Vec<u64> = timing_samples.iter().map(|s| s[4]).collect();
+                        let mut eviction: Vec<u64> = timing_samples.iter().map(|s| s[4]).collect();
+                        let mut total: Vec<u64> = timing_samples.iter().map(|s| s[5]).collect();
 
-                        for v in [&mut transit, &mut ingest, &mut fec, &mut deshred, &mut total] {
+                        for v in [&mut transit, &mut ingest, &mut fec, &mut deshred, &mut eviction, &mut total] {
                             v.sort_unstable();
                         }
 
@@ -211,12 +213,14 @@ pub fn start_forwarder_threads(
                             ingest p50={}us p99={}us max={}us | \
                             fec p50={}us p99={}us max={}us | \
                             deshred p50={}us p99={}us max={}us | \
+                            eviction p50={}us p99={}us max={}us | \
                             total p50={}us p99={}us max={}us",
                             window_max_noentry_reconstruct_us,
                             pct(&transit, 50), pct(&transit, 99), transit.last().unwrap(),
                             pct(&ingest, 50), pct(&ingest, 99), ingest.last().unwrap(),
                             pct(&fec, 50), pct(&fec, 99), fec.last().unwrap(),
                             pct(&deshred, 50), pct(&deshred, 99), deshred.last().unwrap(),
+                            pct(&eviction, 50), pct(&eviction, 99), eviction.last().unwrap(),
                             pct(&total, 50), pct(&total, 99), total.last().unwrap(),
                         );
 

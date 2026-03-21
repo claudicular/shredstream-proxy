@@ -67,6 +67,7 @@ pub struct StageTiming {
     pub ingest_us: u64,
     pub fec_recovery_us: u64,
     pub deshred_us: u64,
+    pub eviction_us: u64,
 }
 
 /// Returns the number of shreds reconstructed
@@ -281,11 +282,7 @@ pub fn reconstruct_shreds(
     }
     let t_deshredded = Instant::now();
 
-    let stage_timing = StageTiming {
-        ingest_us: t_ingested.duration_since(t_start).as_micros() as u64,
-        fec_recovery_us: t_recovered.duration_since(t_ingested).as_micros() as u64,
-        deshred_us: t_deshredded.duration_since(t_recovered).as_micros() as u64,
-    };
+    let t_eviction_start = Instant::now();
 
     if all_shreds.len() > MAX_PROCESSING_AGE {
         let slot_threshold = highest_slot_seen.saturating_sub(SLOT_LOOKBACK);
@@ -347,6 +344,13 @@ pub fn reconstruct_shreds(
             );
         }
     }
+
+    let stage_timing = StageTiming {
+        ingest_us: t_ingested.duration_since(t_start).as_micros() as u64,
+        fec_recovery_us: t_recovered.duration_since(t_ingested).as_micros() as u64,
+        deshred_us: t_deshredded.duration_since(t_recovered).as_micros() as u64,
+        eviction_us: t_eviction_start.elapsed().as_micros() as u64,
+    };
 
     if total_recovered_count > 0 {
         metrics
