@@ -108,7 +108,7 @@ pub fn start_forwarder_threads(
                 const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
                 while !exit.load(Ordering::Relaxed) {
-                    match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
+                    match reconstruct_rx.try_recv() {
                         Ok((t0, pkt_batch)) => {
                             let t_recv = Instant::now();
                             let (_recovered, stage_timing) = deshred::reconstruct_shreds(
@@ -157,8 +157,8 @@ pub fn start_forwarder_threads(
                                 );
                             }
                         }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        Err(crossbeam_channel::TryRecvError::Empty) => {}
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                     }
 
                     // Periodic pxx report
