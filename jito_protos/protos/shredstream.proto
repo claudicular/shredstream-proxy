@@ -54,12 +54,11 @@ message Entry {
 
   // Timestamp (nanos since UNIX epoch) when the forwarder thread received the packet batch
   // that triggered this entry's reconstruction. Consumers can compare with their own clock
-  // to measure end-to-end pipeline latency.
+  // to measure end-to-end pipeline latency (including gRPC transport).
   uint64 producer_timestamp_nanos = 3;
 
-  // Per-stage pipeline timing (microseconds)
-  uint64 stage_channel_transit_us = 4;
-  uint64 stage_ingest_us = 5;
-  uint64 stage_fec_recovery_us = 6;
-  uint64 stage_deshred_us = 7;
+  // Timestamp (nanos since UNIX epoch) right before the entry is sent to gRPC broadcast.
+  // grpc_transport = consumer_now - pre_grpc_timestamp_nanos
+  // producer_processing = pre_grpc_timestamp_nanos - producer_timestamp_nanos
+  uint64 pre_grpc_timestamp_nanos = 4;
 }

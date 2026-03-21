@@ -102,6 +102,11 @@ pub fn start_forwarder_threads(
                 let mut highest_slot_seen: Slot = 0;
                 let rs_cache = ReedSolomonCache::default();
 
+                // Accumulate per-stage timings for periodic pxx reporting
+                let mut timing_samples: Vec<[u64; 5]> = Vec::with_capacity(1024);
+                let mut last_report = Instant::now();
+                const REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok((t0, pkt_batch)) => {
@@ -120,6 +125,7 @@ pub fn start_forwarder_threads(
                             if !deshredded_entries.is_empty() {
                                 let channel_transit_us =
                                     t_recv.duration_since(t0).as_micros() as u64;
+                                let total_us = t0.elapsed().as_micros() as u64;
                                 let elapsed_since_t0 = t0.elapsed();
                                 let producer_timestamp_nanos = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
@@ -127,25 +133,65 @@ pub fn start_forwarder_threads(
                                     .saturating_sub(elapsed_since_t0)
                                     .as_nanos() as u64;
 
+                                timing_samples.push([
+                                    channel_transit_us,
+                                    stage_timing.ingest_us,
+                                    stage_timing.fec_recovery_us,
+                                    stage_timing.deshred_us,
+                                    total_us,
+                                ]);
+
                                 deshredded_entries.drain(..).for_each(
                                     |(slot, _entries, entries_bytes)| {
+                                        let pre_grpc_timestamp_nanos = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_nanos() as u64;
                                         let _ = entry_sender.send(PbEntry {
                                             slot,
                                             entries: entries_bytes,
                                             producer_timestamp_nanos,
-                                            stage_channel_transit_us: channel_transit_us,
-                                            stage_ingest_us: stage_timing.ingest_us,
-                                            stage_fec_recovery_us: stage_timing.fec_recovery_us,
-                                            stage_deshred_us: stage_timing.deshred_us,
+                                            pre_grpc_timestamp_nanos,
                                         });
                                     },
                                 );
-                            } else {
-                                deshredded_entries.clear();
                             }
                         }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {} // do nothing
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+
+                    // Periodic pxx report
+                    if last_report.elapsed() >= REPORT_INTERVAL && !timing_samples.is_empty() {
+                        let n = timing_samples.len();
+                        let mut transit: Vec<u64> = timing_samples.iter().map(|s| s[0]).collect();
+                        let mut ingest: Vec<u64> = timing_samples.iter().map(|s| s[1]).collect();
+                        let mut fec: Vec<u64> = timing_samples.iter().map(|s| s[2]).collect();
+                        let mut deshred: Vec<u64> = timing_samples.iter().map(|s| s[3]).collect();
+                        let mut total: Vec<u64> = timing_samples.iter().map(|s| s[4]).collect();
+
+                        for v in [&mut transit, &mut ingest, &mut fec, &mut deshred, &mut total] {
+                            v.sort_unstable();
+                        }
+
+                        let pct = |v: &[u64], p: usize| v[v.len() * p / 100];
+
+                        info!(
+                            "pipeline_stats n={n} | \
+                            transit p50={}us p99={}us max={}us | \
+                            ingest p50={}us p99={}us max={}us | \
+                            fec p50={}us p99={}us max={}us | \
+                            deshred p50={}us p99={}us max={}us | \
+                            total p50={}us p99={}us max={}us",
+                            pct(&transit, 50), pct(&transit, 99), transit.last().unwrap(),
+                            pct(&ingest, 50), pct(&ingest, 99), ingest.last().unwrap(),
+                            pct(&fec, 50), pct(&fec, 99), fec.last().unwrap(),
+                            pct(&deshred, 50), pct(&deshred, 99), deshred.last().unwrap(),
+                            pct(&total, 50), pct(&total, 99), total.last().unwrap(),
+                        );
+
+                        timing_samples.clear();
+                        last_report = Instant::now();
                     }
                 }
             })
