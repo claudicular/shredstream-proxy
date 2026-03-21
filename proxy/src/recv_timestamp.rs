@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 //! Timestamped UDP receive using SO_TIMESTAMPNS.
 //!
 //! Provides a `recv_mmsg` variant that extracts the kernel-level socket
@@ -22,7 +23,7 @@ use {
     log::{info, warn},
     solana_perf::packet::{PacketBatch, PACKETS_PER_BATCH, NUM_RCVMMSGS},
     solana_streamer::{
-        packet::Packet,
+        packet::{Meta, Packet},
         streamer::StreamerReceiveStats,
     },
     std::{
@@ -76,13 +77,13 @@ fn extract_timestamp(hdr: &msghdr) -> Option<i64> {
         return None;
     }
     unsafe {
-        let mut cmsg: *mut cmsghdr = CMSG_FIRSTHDR(hdr);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == SOL_SOCKET && (*cmsg).cmsg_type == SCM_TIMESTAMPNS {
-                let ts = &*(CMSG_DATA(cmsg) as *const timespec);
-                return Some(ts.tv_sec * 1_000_000_000 + ts.tv_nsec);
-            }
-            cmsg = libc::__cmsg_nxthdr(hdr as *const _ as *mut _, cmsg);
+        let cmsg: *mut cmsghdr = CMSG_FIRSTHDR(hdr);
+        if !cmsg.is_null()
+            && (*cmsg).cmsg_level == SOL_SOCKET
+            && (*cmsg).cmsg_type == SCM_TIMESTAMPNS
+        {
+            let ts = &*(CMSG_DATA(cmsg) as *const timespec);
+            return Some(ts.tv_sec * 1_000_000_000 + ts.tv_nsec);
         }
     }
     None
