@@ -105,6 +105,7 @@ pub fn start_forwarder_threads(
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok((t0, pkt_batch)) => {
+                            let t_recv = Instant::now();
                             deshred::reconstruct_shreds(
                                 &pkt_batch,
                                 &mut all_shreds,
@@ -115,6 +116,15 @@ pub fn start_forwarder_threads(
                                 &rs_cache,
                                 &metrics,
                             );
+
+                            if !deshredded_entries.is_empty() {
+                                debug!(
+                                    "pipeline_channel: transit={}us reconstruct={}us total={}us",
+                                    t_recv.duration_since(t0).as_micros(),
+                                    t_recv.elapsed().as_micros(),
+                                    t0.elapsed().as_micros(),
+                                );
+                            }
 
                             // Compute producer timestamp from T0 (Instant) by offsetting SystemTime
                             let producer_timestamp_nanos = if !deshredded_entries.is_empty() {

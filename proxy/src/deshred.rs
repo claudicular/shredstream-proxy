@@ -1,4 +1,4 @@
-use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering};
+use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering, time::Instant};
 
 use itertools::Itertools;
 use jito_protos::shredstream::TraceShred;
@@ -82,6 +82,7 @@ pub fn reconstruct_shreds(
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
 ) -> usize {
+    let t_start = Instant::now();
     deshredded_entries.clear();
     slot_fec_indexes_to_iterate.clear();
     // ingest all packets
@@ -132,6 +133,7 @@ pub fn reconstruct_shreds(
     }
     slot_fec_indexes_to_iterate.sort_unstable();
     slot_fec_indexes_to_iterate.dedup();
+    let t_ingested = Instant::now();
 
     // try recovering by FEC set
     // already checked if FEC set is completed or deserialized
@@ -194,6 +196,7 @@ pub fn reconstruct_shreds(
             shreds.clear();
         }
     }
+    let t_recovered = Instant::now();
 
     // deshred and bincode deserialize
     for (slot, fec_set_index) in slot_fec_indexes_to_iterate.iter() {
@@ -267,6 +270,18 @@ pub fn reconstruct_shreds(
             state_tracker.already_recovered_fec_sets[shred.fec_set_index() as usize] = true;
             state_tracker.already_deshredded[shred.index() as usize] = true;
         })
+    }
+    let t_deshredded = Instant::now();
+
+    if !deshredded_entries.is_empty() {
+        debug!(
+            "pipeline_stages: ingest={}us fec_recovery={}us deshred={}us total={}us entries={}",
+            t_ingested.duration_since(t_start).as_micros(),
+            t_recovered.duration_since(t_ingested).as_micros(),
+            t_deshredded.duration_since(t_recovered).as_micros(),
+            t_deshredded.duration_since(t_start).as_micros(),
+            deshredded_entries.len(),
+        );
     }
 
     if all_shreds.len() > MAX_PROCESSING_AGE {
