@@ -86,7 +86,7 @@ pub fn reconstruct_shreds(
     >,
     tracker_pool: &mut Vec<ShredsStateTracker>,
     slot_fec_indexes_to_iterate: &mut Vec<(Slot, u32)>,
-    deshredded_entries: &mut Vec<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>,
+    deshredded_entries: &mut Vec<(Slot, Vec<u8>)>,
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
@@ -241,37 +241,16 @@ pub fn reconstruct_shreds(
             }
         };
 
-        let entries = match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(
-            &deshredded_payload,
-        ) {
-            Ok(entries) => entries,
-            Err(e) => {
-                debug!(
-                        "Failed to deserialize bincode payload of size {} for slot {slot}, start_data_complete_idx: {start_data_complete_idx}, end_data_complete_idx: {end_data_complete_idx}, unknown_start: {unknown_start}. Err: {e}",
-                        deshredded_payload.len()
-                    );
-                metrics
-                    .bincode_deserialize_error_count
-                    .fetch_add(1, Ordering::Relaxed);
-                if unknown_start {
-                    metrics
-                        .unknown_start_position_error_count
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                continue;
-            }
-        };
-        metrics
-            .entry_count
-            .fetch_add(entries.len() as u64, Ordering::Relaxed);
-        let txn_count = entries.iter().map(|e| e.transactions.len() as u64).sum();
-        metrics.txn_count.fetch_add(txn_count, Ordering::Relaxed);
-        debug!(
-            "Successfully decoded slot: {slot} start_data_complete_idx: {start_data_complete_idx} end_data_complete_idx: {end_data_complete_idx} with entry count: {}, txn count: {txn_count}",
-            entries.len(),
-        );
+        // Read entry count from bincode header (first 8 bytes = Vec length as little-endian u64)
+        // Skip full deserialization — consumer deserializes on its end
+        if deshredded_payload.len() >= 8 {
+            let entry_count = u64::from_le_bytes(deshredded_payload[..8].try_into().unwrap());
+            metrics
+                .entry_count
+                .fetch_add(entry_count, Ordering::Relaxed);
+        }
 
-        deshredded_entries.push((*slot, entries, deshredded_payload));
+        deshredded_entries.push((*slot, deshredded_payload));
         to_deshred.iter().for_each(|shred| {
             let Some(shred) = shred.as_ref() else {
                 return;
@@ -750,7 +729,11 @@ mod tests {
         assert_eq!(
             deshredded_entries
                 .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
+                .map(|(_slot, entries_bytes)| {
+                        bincode::deserialize::<Vec<solana_entry::entry::Entry>>(entries_bytes)
+                            .unwrap()
+                            .len()
+                    })
                 .sum::<usize>(),
             13580
         );
@@ -758,7 +741,7 @@ mod tests {
 
         let slot_to_entry = deshredded_entries
             .iter()
-            .into_group_map_by(|(slot, _entries, _entries_bytes)| *slot);
+            .into_group_map_by(|(slot, _entries_bytes)| *slot);
         // slot_to_entry
         //     .iter()
         //     .sorted_by_key(|(slot, _)| *slot)
@@ -809,7 +792,11 @@ mod tests {
         assert_eq!(
             deshredded_entries
                 .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
+                .map(|(_slot, entries_bytes)| {
+                        bincode::deserialize::<Vec<solana_entry::entry::Entry>>(entries_bytes)
+                            .unwrap()
+                            .len()
+                    })
                 .sum::<usize>(),
             13580
         );
@@ -817,19 +804,22 @@ mod tests {
 
         let slot_to_entry = deshredded_entries
             .iter()
-            .into_group_map_by(|(slot, _entries, _entries_bytes)| *slot);
+            .into_group_map_by(|(slot, _entries_bytes)| *slot);
         assert_eq!(slot_to_entry.len(), 29);
     }
 
     /// Helper function to compare all shred output
     #[allow(unused)]
     fn debug_to_disk(
-        deshredded_entries: &[(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)],
+        deshredded_entries: &[(Slot, Vec<u8>)],
         filepath: &str,
     ) {
         let entries = deshredded_entries
             .iter()
-            .map(|(slot, entries, _entries_bytes)| (slot, entries))
+            .map(|(slot, entries_bytes)| {
+                let entries = bincode::deserialize::<Vec<solana_entry::entry::Entry>>(entries_bytes).unwrap();
+                (slot, entries)
+            })
             .into_group_map_by(|(slot, _entries)| *slot)
             .into_iter()
             .map(|(key, values)| {
@@ -931,7 +921,11 @@ mod tests {
         assert_eq!(
             deshredded_entries
                 .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
+                .map(|(_slot, entries_bytes)| {
+                        bincode::deserialize::<Vec<solana_entry::entry::Entry>>(entries_bytes)
+                            .unwrap()
+                            .len()
+                    })
                 .sum::<usize>(),
             43170
         );
@@ -939,7 +933,7 @@ mod tests {
 
         let slot_to_entry = deshredded_entries
             .iter()
-            .into_group_map_by(|(slot, _entries, _entries_bytes)| *slot);
+            .into_group_map_by(|(slot, _entries_bytes)| *slot);
         // slot_to_entry
         //     .iter()
         //     .sorted_by_key(|(slot, _)| *slot)
@@ -990,7 +984,11 @@ mod tests {
         assert_eq!(
             deshredded_entries
                 .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
+                .map(|(_slot, entries_bytes)| {
+                        bincode::deserialize::<Vec<solana_entry::entry::Entry>>(entries_bytes)
+                            .unwrap()
+                            .len()
+                    })
                 .sum::<usize>(),
             43170
         );
@@ -998,7 +996,7 @@ mod tests {
 
         let slot_to_entry = deshredded_entries
             .iter()
-            .into_group_map_by(|(slot, _entries, _entries_bytes)| *slot);
+            .into_group_map_by(|(slot, _entries_bytes)| *slot);
         assert_eq!(slot_to_entry.len(), 61);
     }
 
@@ -1078,7 +1076,11 @@ mod tests {
         assert_eq!(
             deshredded_entries
                 .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
+                .map(|(_slot, entries_bytes)| {
+                        bincode::deserialize::<Vec<solana_entry::entry::Entry>>(entries_bytes)
+                            .unwrap()
+                            .len()
+                    })
                 .sum::<usize>(),
             entries.len()
         );
@@ -1114,7 +1116,11 @@ mod tests {
         assert_eq!(
             deshredded_entries
                 .iter()
-                .map(|(_slot, entries, _entries_bytes)| entries.len())
+                .map(|(_slot, entries_bytes)| {
+                        bincode::deserialize::<Vec<solana_entry::entry::Entry>>(entries_bytes)
+                            .unwrap()
+                            .len()
+                    })
                 .sum::<usize>(),
             entries.len()
         );

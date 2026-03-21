@@ -115,8 +115,7 @@ pub fn start_forwarder_threads(
                 >::default();
                 let mut tracker_pool = Vec::<ShredsStateTracker>::new();
                 let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
-                let mut deshredded_entries =
-                    Vec::<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>::new();
+                let mut deshredded_entries = Vec::<(Slot, Vec<u8>)>::new();
                 let mut highest_slot_seen: Slot = 0;
                 let rs_cache = ReedSolomonCache::default();
 
@@ -167,7 +166,7 @@ pub fn start_forwarder_threads(
                                 ]);
 
                                 deshredded_entries.drain(..).for_each(
-                                    |(slot, _entries, entries_bytes)| {
+                                    |(slot, entries_bytes)| {
                                         let pre_grpc_timestamp_nanos = SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
                                             .unwrap()
