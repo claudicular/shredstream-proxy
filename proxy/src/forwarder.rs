@@ -125,6 +125,9 @@ pub fn start_forwarder_threads(
                 let mut last_report = Instant::now();
                 const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
+                // Track max processing time of batches that don't produce entries
+                let mut max_noentry_reconstruct_us: u64 = 0;
+
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.try_recv() {
                         Ok((t0, pkt_batch)) => {
@@ -139,6 +142,7 @@ pub fn start_forwarder_threads(
                                 &rs_cache,
                                 &metrics,
                             );
+                            let reconstruct_us = t_recv.elapsed().as_micros() as u64;
 
                             if !deshredded_entries.is_empty() {
                                 let channel_transit_us =
@@ -173,6 +177,10 @@ pub fn start_forwarder_threads(
                                         });
                                     },
                                 );
+                                max_noentry_reconstruct_us = 0;
+                            } else {
+                                max_noentry_reconstruct_us =
+                                    max_noentry_reconstruct_us.max(reconstruct_us);
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -195,12 +203,13 @@ pub fn start_forwarder_threads(
                         let pct = |v: &[u64], p: usize| v[v.len() * p / 100];
 
                         info!(
-                            "pipeline_stats n={n} | \
+                            "pipeline_stats n={n} max_noentry_reconstruct={}us | \
                             transit p50={}us p99={}us max={}us | \
                             ingest p50={}us p99={}us max={}us | \
                             fec p50={}us p99={}us max={}us | \
                             deshred p50={}us p99={}us max={}us | \
                             total p50={}us p99={}us max={}us",
+                            max_noentry_reconstruct_us,
                             pct(&transit, 50), pct(&transit, 99), transit.last().unwrap(),
                             pct(&ingest, 50), pct(&ingest, 99), ingest.last().unwrap(),
                             pct(&fec, 50), pct(&fec, 99), fec.last().unwrap(),
