@@ -2,7 +2,7 @@ use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering, time::Instan
 
 use itertools::Itertools;
 use jito_protos::shredstream::TraceShred;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use prost::Message;
 use solana_ledger::{
     blockstore::MAX_DATA_SHREDS_PER_SLOT,
@@ -61,6 +61,14 @@ impl ShredsStateTracker {
     }
 }
 
+/// Per-batch stage timing in microseconds, returned from reconstruct_shreds.
+#[derive(Default)]
+pub struct StageTiming {
+    pub ingest_us: u64,
+    pub fec_recovery_us: u64,
+    pub deshred_us: u64,
+}
+
 /// Returns the number of shreds reconstructed
 /// Updates all_shreds with current state, and deshredded_entries with returned values
 /// receive shreds per FEC set, attempting to recover the other shreds in the fec set so you do not have to wait until all data shreds have arrived.
@@ -81,7 +89,7 @@ pub fn reconstruct_shreds(
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
-) -> usize {
+) -> (usize, StageTiming) {
     let t_start = Instant::now();
     deshredded_entries.clear();
     slot_fec_indexes_to_iterate.clear();
@@ -273,16 +281,11 @@ pub fn reconstruct_shreds(
     }
     let t_deshredded = Instant::now();
 
-    if !deshredded_entries.is_empty() {
-        info!(
-            "pipeline_stages: ingest={}us fec_recovery={}us deshred={}us total={}us entries={}",
-            t_ingested.duration_since(t_start).as_micros(),
-            t_recovered.duration_since(t_ingested).as_micros(),
-            t_deshredded.duration_since(t_recovered).as_micros(),
-            t_deshredded.duration_since(t_start).as_micros(),
-            deshredded_entries.len(),
-        );
-    }
+    let stage_timing = StageTiming {
+        ingest_us: t_ingested.duration_since(t_start).as_micros() as u64,
+        fec_recovery_us: t_recovered.duration_since(t_ingested).as_micros() as u64,
+        deshred_us: t_deshredded.duration_since(t_recovered).as_micros() as u64,
+    };
 
     if all_shreds.len() > MAX_PROCESSING_AGE {
         let slot_threshold = highest_slot_seen.saturating_sub(SLOT_LOOKBACK);
@@ -351,7 +354,7 @@ pub fn reconstruct_shreds(
             .fetch_add(total_recovered_count as u64, Ordering::Relaxed);
     }
 
-    total_recovered_count
+    (total_recovered_count, stage_timing)
 }
 
 #[allow(unused)]
@@ -716,7 +719,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
+        let (recovered_count, _stage_timing) = reconstruct_shreds(
             &PacketBatch::new(
                 packets
                     .packets
@@ -773,7 +776,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
+        let (recovered_count, _stage_timing) = reconstruct_shreds(
             &PacketBatch::new(
                 packets
                     .packets
@@ -897,7 +900,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
+        let (recovered_count, _stage_timing) = reconstruct_shreds(
             &PacketBatch::new(
                 packets
                     .packets
@@ -954,7 +957,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
+        let (recovered_count, _stage_timing) = reconstruct_shreds(
             &PacketBatch::new(
                 packets
                     .packets
@@ -1057,7 +1060,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
+        let (recovered_count, _stage_timing) = reconstruct_shreds(
             &PacketBatch::new(packets.clone()),
             &mut all_shreds,
             &mut tracker_pool,
@@ -1086,7 +1089,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
-        let recovered_count = reconstruct_shreds(
+        let (recovered_count, _stage_timing) = reconstruct_shreds(
             &PacketBatch::new(
                 packets
                     .iter()

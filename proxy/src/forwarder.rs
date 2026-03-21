@@ -106,7 +106,7 @@ pub fn start_forwarder_threads(
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok((t0, pkt_batch)) => {
                             let t_recv = Instant::now();
-                            deshred::reconstruct_shreds(
+                            let (_recovered, stage_timing) = deshred::reconstruct_shreds(
                                 &pkt_batch,
                                 &mut all_shreds,
                                 &mut tracker_pool,
@@ -118,35 +118,31 @@ pub fn start_forwarder_threads(
                             );
 
                             if !deshredded_entries.is_empty() {
-                                info!(
-                                    "pipeline_channel: transit={}us reconstruct={}us total={}us",
-                                    t_recv.duration_since(t0).as_micros(),
-                                    t_recv.elapsed().as_micros(),
-                                    t0.elapsed().as_micros(),
-                                );
-                            }
-
-                            // Compute producer timestamp from T0 (Instant) by offsetting SystemTime
-                            let producer_timestamp_nanos = if !deshredded_entries.is_empty() {
+                                let channel_transit_us =
+                                    t_recv.duration_since(t0).as_micros() as u64;
                                 let elapsed_since_t0 = t0.elapsed();
-                                SystemTime::now()
+                                let producer_timestamp_nanos = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap()
                                     .saturating_sub(elapsed_since_t0)
-                                    .as_nanos() as u64
-                            } else {
-                                0
-                            };
+                                    .as_nanos() as u64;
 
-                            deshredded_entries.drain(..).for_each(
-                                |(slot, _entries, entries_bytes)| {
-                                    let _ = entry_sender.send(PbEntry {
-                                        slot,
-                                        entries: entries_bytes,
-                                        producer_timestamp_nanos,
-                                    });
-                                },
-                            );
+                                deshredded_entries.drain(..).for_each(
+                                    |(slot, _entries, entries_bytes)| {
+                                        let _ = entry_sender.send(PbEntry {
+                                            slot,
+                                            entries: entries_bytes,
+                                            producer_timestamp_nanos,
+                                            stage_channel_transit_us: channel_transit_us,
+                                            stage_ingest_us: stage_timing.ingest_us,
+                                            stage_fec_recovery_us: stage_timing.fec_recovery_us,
+                                            stage_deshred_us: stage_timing.deshred_us,
+                                        });
+                                    },
+                                );
+                            } else {
+                                deshredded_entries.clear();
+                            }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {} // do nothing
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
