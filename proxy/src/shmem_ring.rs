@@ -24,7 +24,7 @@ const MAGIC: u64 = 0x534852494E474246;
 const VERSION: u32 = 1;
 const HEADER_SIZE: usize = 128;
 const DEFAULT_DATA_REGION_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
-const MAX_ENTRY_SIZE: usize = 128 * 1024; // 128 KiB
+const MAX_ENTRY_SIZE: usize = 256 * 1024; // 256 KiB
 const ENTRY_HEADER_SIZE: usize = 24; // seq(8) + slot(8) + data_len(4) + pad(4)
 
 /// Round up to next multiple of 8.
