@@ -59,6 +59,7 @@ pub fn start_forwarder_threads(
     forward_stats: Arc<StreamerReceiveStats>,
     metrics: Arc<ShredMetrics>,
     reconstructor_core_id: Option<usize>,
+    shmem_ring_path: Option<std::path::PathBuf>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
@@ -105,6 +106,12 @@ pub fn start_forwarder_threads(
                         }
                     }
                 }
+
+                // Create shared memory ring buffer if configured
+                let mut shmem_ring = shmem_ring_path.as_ref().map(|path| {
+                    crate::shmem_ring::ShmemRingProducer::create(path)
+                        .expect("Failed to create shmem ring buffer")
+                });
 
                 let mut all_shreds = ahash::HashMap::<
                     Slot,
@@ -167,6 +174,12 @@ pub fn start_forwarder_threads(
 
                                 deshredded_entries.drain(..).for_each(
                                     |(slot, entries_bytes)| {
+                                        // Shmem write FIRST (lowest latency path)
+                                        if let Some(ref mut ring) = shmem_ring {
+                                            ring.publish(slot, producer_timestamp_nanos, &entries_bytes);
+                                        }
+
+                                        // Then gRPC broadcast (existing path)
                                         let pre_grpc_timestamp_nanos = SystemTime::now()
                                             .duration_since(UNIX_EPOCH)
                                             .unwrap()

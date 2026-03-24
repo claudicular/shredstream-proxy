@@ -40,6 +40,7 @@ mod heartbeat;
 mod multicast_config;
 mod recv_timestamp;
 mod server;
+pub mod shmem_ring;
 mod token_authenticator;
 
 #[derive(Clone, Debug, Parser)]
@@ -141,6 +142,12 @@ struct CommonArgs {
     /// Reduces tail latency from OS scheduler jitter.
     #[arg(long, env)]
     reconstructor_core_id: Option<usize>,
+
+    /// Path to shared memory ring buffer file (e.g. /dev/shm/shredstream.ring).
+    /// When set, entries are written to the ring buffer for zero-copy consumption
+    /// by a local process, in addition to the gRPC stream.
+    #[arg(long, env)]
+    shmem_ring_path: Option<std::path::PathBuf>,
 
     /// Public IP address to use.
     /// Overrides value fetched from `ifconfig.me`.
@@ -316,6 +323,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         forward_stats.clone(),
         metrics.clone(),
         args.reconstructor_core_id,
+        args.shmem_ring_path.clone(),
         shutdown_receiver.clone(),
         exit.clone(),
     );
