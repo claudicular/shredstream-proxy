@@ -58,6 +58,7 @@ pub fn start_forwarder_threads(
     use_discovery_service: bool,
     forward_stats: Arc<StreamerReceiveStats>,
     metrics: Arc<ShredMetrics>,
+    shmem_ring_path: Option<std::path::PathBuf>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
@@ -87,6 +88,12 @@ pub fn start_forwarder_threads(
         let hdl = std::thread::Builder::new()
             .name("shred_reconstructor".to_string())
             .spawn(move || {
+                // Create shared memory ring buffer if configured
+                let mut shmem_ring = shmem_ring_path.as_ref().map(|path| {
+                    crate::shmem_ring::ShmemRingProducer::create(path)
+                        .expect("Failed to create shmem ring buffer")
+                });
+
                 let mut all_shreds = ahash::HashMap::<
                     Slot,
                     (
@@ -114,6 +121,12 @@ pub fn start_forwarder_threads(
 
                             deshredded_entries.drain(..).for_each(
                                 |(slot, entries_bytes)| {
+                                    // Shmem write FIRST (lowest latency path)
+                                    if let Some(ref mut ring) = shmem_ring {
+                                        ring.publish(slot, &entries_bytes);
+                                    }
+
+                                    // Then gRPC broadcast (existing path)
                                     let _ = entry_sender.send(PbEntry {
                                         slot,
                                         entries: entries_bytes,
