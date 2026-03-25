@@ -149,18 +149,18 @@ impl ShmemRingProducer {
     }
 
     /// Write an entry to the ring buffer.
-    /// Returns the sequence number assigned to this entry.
-    ///
-    /// # Panics
-    /// Panics if `entries_bytes.len() > MAX_ENTRY_SIZE`.
+    /// Returns the sequence number assigned, or 0 if the entry was too large and skipped.
     pub fn publish(&mut self, slot: u64, timestamp_ns: u64, entries_bytes: &[u8]) -> u64 {
         let data_len = entries_bytes.len();
-        assert!(
-            data_len <= MAX_ENTRY_SIZE,
-            "entry too large: {} > {}",
-            data_len,
-            MAX_ENTRY_SIZE
-        );
+        if data_len > MAX_ENTRY_SIZE {
+            log::warn!(
+                "shmem_ring: skipping entry for slot {} ({} bytes > {} max)",
+                slot,
+                data_len,
+                MAX_ENTRY_SIZE
+            );
+            return 0;
+        }
 
         let total_size = align8(ENTRY_HEADER_SIZE + data_len);
 
