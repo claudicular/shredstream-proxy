@@ -227,6 +227,9 @@ fn shutdown_notifier(exit: Arc<AtomicBool>) -> io::Result<(Sender<()>, Receiver<
 
 pub type ReconstructedShredsMap = HashMap<Slot, HashMap<u32 /* fec_set_index */, Vec<Shred>>>;
 fn main() -> Result<(), ShredstreamProxyError> {
+    // Load a .env from the working directory (or any ancestor) if present, so the
+    // `#[arg(long, env)]` flags (and RUST_LOG) can be set there. No-op if absent.
+    let _ = dotenvy::dotenv();
     env_logger::builder().init();
 
     let all_args: Args = Args::parse();
