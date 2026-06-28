@@ -59,6 +59,8 @@ pub fn start_forwarder_threads(
     forward_stats: Arc<StreamerReceiveStats>,
     metrics: Arc<ShredMetrics>,
     shmem_ring_path: Option<std::path::PathBuf>,
+    bench_handle: Option<crate::benchmark::BenchmarkHandle>,
+    bench_kernel_timestamps: bool,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
@@ -149,18 +151,32 @@ pub fn start_forwarder_threads(
         .enumerate()
         .flat_map(|(thread_id, incoming_shred_socket)| {
             let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
-            let listen_thread = streamer::receiver(
-                format!("ssListen{thread_id}"),
-                Arc::new(incoming_shred_socket),
-                exit.clone(),
-                packet_sender,
-                recycler.clone(),
-                forward_stats.clone(),
-                Duration::default(),
-                false,
-                None,
-                false,
-            );
+            // When kernel timestamps are enabled, use the timestamped recv path
+            // which taps the benchmark in the listen thread (closest to receipt)
+            // and forwards the PacketBatch downstream unchanged. Otherwise use the
+            // stock streamer receiver and tap (if any) in the send thread.
+            let listen_thread = match (bench_handle.as_ref(), bench_kernel_timestamps) {
+                (Some(bh), true) => crate::benchmark::recv_timestamp::start_recv_and_tap_thread(
+                    format!("ssListen{thread_id}"),
+                    Arc::new(incoming_shred_socket),
+                    exit.clone(),
+                    packet_sender,
+                    forward_stats.clone(),
+                    bh.clone(),
+                ),
+                _ => streamer::receiver(
+                    format!("ssListen{thread_id}"),
+                    Arc::new(incoming_shred_socket),
+                    exit.clone(),
+                    packet_sender,
+                    recycler.clone(),
+                    forward_stats.clone(),
+                    Duration::default(),
+                    false,
+                    None,
+                    false,
+                ),
+            };
 
             let deduper = deduper.clone();
             let unioned_dest_sockets = unioned_dest_sockets.clone();
@@ -168,6 +184,13 @@ pub fn start_forwarder_threads(
             let shutdown_receiver = shutdown_receiver.clone();
             let reconstruct_tx = reconstruct_tx.clone();
             let exit = exit.clone();
+            // Send-thread tap only when NOT using the kernel-timestamp recv path
+            // (avoids tapping the same packets twice).
+            let send_bench_handle = if bench_kernel_timestamps {
+                None
+            } else {
+                bench_handle.clone()
+            };
 
             let send_thread = Builder::new()
                 .name(format!("ssPxyTx_{thread_id}"))
@@ -196,6 +219,7 @@ pub fn start_forwarder_threads(
                                     &reconstruct_tx,
                                     debug_trace_shred,
                                     &metrics,
+                                    send_bench_handle.as_ref(),
                                 );
 
                                 // If the channel is closed or error, break out
@@ -236,6 +260,7 @@ fn recv_from_channel_and_send_multiple_dest(
     reconstruct_tx: &crossbeam_channel::Sender<PacketBatch>,
     debug_trace_shred: bool,
     metrics: &ShredMetrics,
+    bench: Option<&crate::benchmark::BenchmarkHandle>,
 ) -> Result<(), ShredstreamProxyError> {
     let packet_batch = maybe_packet_batch.map_err(ShredstreamProxyError::RecvError)?;
     let trace_shred_received_time = SystemTime::now();
@@ -248,8 +273,20 @@ fn recv_from_channel_and_send_multiple_dest(
         packet_batch.iter().map(|x| x.meta().size).sum::<usize>()
     );
 
+    // Hand off to the reconstructor FIRST so the benchmark tap never delays the
+    // reconstruct -> shmem/gRPC path.
     if should_reconstruct_shreds {
         let _ = reconstruct_tx.try_send(packet_batch.clone());
+    }
+
+    // Benchmark tap (userspace timestamp path). Runs BEFORE dedup so every
+    // source's copy of a shred is observed; read-only over the batch.
+    if let Some(bench) = bench {
+        let rx_ts_ns = trace_shred_received_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        bench.observe_batch(&packet_batch, rx_ts_ns);
     }
 
     let mut packet_batch_vec = vec![packet_batch];
@@ -708,6 +745,7 @@ mod tests {
             &reconstruct_tx,
             false,
             &Arc::new(ShredMetrics::default()),
+            None,
         )
         .unwrap();
 

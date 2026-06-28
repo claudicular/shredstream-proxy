@@ -34,6 +34,7 @@ use crate::{
     forwarder::ShredMetrics, multicast_config::create_multicast_socket_on_device,
     token_authenticator::BlockEngineConnectionError,
 };
+pub mod benchmark;
 mod deshred;
 pub mod forwarder;
 mod heartbeat;
@@ -85,6 +86,9 @@ struct ShredstreamArgs {
 
 #[derive(clap::Args, Clone, Debug)]
 struct CommonArgs {
+    #[clap(flatten)]
+    benchmark: benchmark::BenchmarkArgs,
+
     /// Address where Shredstream proxy listens.
     #[arg(long, env, default_value_t = IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))]
     src_bind_addr: IpAddr,
@@ -303,6 +307,15 @@ fn main() -> Result<(), ShredstreamProxyError> {
         args.multicast_bind_ip,
     )
     .inspect(|mcast_socket| info!("Multicast listeners found: {mcast_socket:?}."));
+
+    // Start the validator-granularity shred-source benchmark (no-op unless enabled).
+    let benchmark_runtime = benchmark::start(args.benchmark.to_config(), exit.clone());
+    let bench_handle = benchmark_runtime.as_ref().map(|rt| rt.handle.clone());
+    let bench_kernel_timestamps = benchmark_runtime
+        .as_ref()
+        .map(|rt| rt.kernel_timestamps)
+        .unwrap_or(false);
+
     let forwarder_hdls = forwarder::start_forwarder_threads(
         unioned_dest_sockets.clone(),
         args.src_bind_addr,
@@ -317,10 +330,15 @@ fn main() -> Result<(), ShredstreamProxyError> {
         forward_stats.clone(),
         metrics.clone(),
         args.shmem_ring_path.clone(),
+        bench_handle,
+        bench_kernel_timestamps,
         shutdown_receiver.clone(),
         exit.clone(),
     );
     thread_handles.extend(forwarder_hdls);
+    if let Some(rt) = benchmark_runtime {
+        thread_handles.extend(rt.join_handles);
+    }
 
     let report_metrics_thread = {
         let exit = exit.clone();

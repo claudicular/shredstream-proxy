@@ -8,3 +8,8 @@
 .idea/
 
 .env
+
+# Local validator map for the benchmark (large, regenerable; lives on the prod
+# host at /home/sol/measured_validators_map.json). Refresh with:
+#   scp sol@64.130.41.179:/home/sol/measured_validators_map.json data/measured_validators_map.json
+/data/
