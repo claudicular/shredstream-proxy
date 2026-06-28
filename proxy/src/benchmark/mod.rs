@@ -15,6 +15,7 @@ pub mod aggregator;
 pub mod leader;
 pub mod parse;
 pub mod recv_timestamp;
+pub mod sources;
 pub mod stats;
 pub mod validators;
 

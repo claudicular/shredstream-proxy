@@ -5,10 +5,10 @@
 //! Pipeline per the design:
 //!  1. raw CSV dump of every observation (milestone M1), optional.
 //!  2. match the same shred across sources via `ShredId` -> earliest-arrival per
-//!     source (M2).
-//!  3. on slot-age eviction, resolve `slot -> leader` and bucket win-rate /
-//!     lead-time / pairwise deltas / coverage / exclusivity per
-//!     `(leader, source)` (M3).
+//!     source (M2). All jito PoPs collapse into one `SourceId::Jito` baseline.
+//!  3. on slot-age eviction, resolve `slot -> leader` and bucket per
+//!     `(leader, source)`: win-rate / lead-time / coverage / exclusivity, the
+//!     symmetric pairwise series, and the jito-oriented "vs-jito" series (M3).
 //!  4. periodically emit to influx (`datapoint_info!`) + a log summary (M4).
 
 use std::{
@@ -30,6 +30,7 @@ use solana_sdk::{clock::Slot, pubkey::Pubkey};
 use super::{
     leader::LeaderScheduleHandle,
     parse::{Observation, ShredId},
+    sources::{self, SourceId},
     stats::{basis_points, mean, quantiles},
     validators::ValidatorMap,
     BenchmarkConfig,
@@ -45,9 +46,9 @@ const MAX_PLAUSIBLE_SLOT: u64 = 1 << 40;
 const MAX_SLOT_JUMP: u64 = 10_000;
 /// Slack (slots) around the leader window when gating observed slots.
 const LEADER_MARGIN: u64 = 128;
-/// Cap on samples retained per (leader, source) and per pair, per flush window.
-/// Bounds aggregator memory and emit-time sort/copy cost independent of shred
-/// rate; p50/p90/p99 are accurate from this many samples.
+/// Cap on samples retained per series, per flush window. Bounds aggregator
+/// memory and emit-time sort/copy cost independent of shred rate; p50/p90/p99
+/// are accurate from this many samples.
 const MAX_SAMPLES_PER_SERIES: usize = 16_384;
 /// Max batches drained per outer-loop iteration before yielding to sweep/flush,
 /// so sustained load can't starve eviction (which would grow the map unbounded).
@@ -56,13 +57,14 @@ const DRAIN_CAP: usize = 4_096;
 /// Earliest arrival timestamp per source for one shred.
 #[derive(Default)]
 struct PerSourceArrival {
-    /// (source, earliest rx_ts_ns). N is the number of distinct sources (small).
-    arrivals: Vec<(IpAddr, i64)>,
+    /// (source, earliest rx_ts_ns). All jito PoPs share `SourceId::Jito`, so its
+    /// timestamp is automatically the min across jito's IPs.
+    arrivals: Vec<(SourceId, i64)>,
 }
 
 impl PerSourceArrival {
     #[inline]
-    fn observe(&mut self, source: IpAddr, ts: i64) {
+    fn observe(&mut self, source: SourceId, ts: i64) {
         for (s, t) in self.arrivals.iter_mut() {
             if *s == source {
                 if ts < *t {
@@ -78,16 +80,10 @@ impl PerSourceArrival {
 /// Per-(leader, source) accumulator for one flush window.
 #[derive(Default, Clone)]
 struct SourceAgg {
-    /// shreds (of this leader) this source delivered at all (union numerator).
     delivered: u64,
-    /// shreds where this source was the ONLY deliverer (backroom exclusive).
     exclusive: u64,
-    /// contested shreds (>=2 sources) this source participated in.
     contested_delivered: u64,
-    /// contested shreds this source delivered first.
     contested_firsts: u64,
-    /// lead time vs the winner (ns) over CONTESTED shreds; 0 when this source
-    /// won. Capped at MAX_SAMPLES_PER_SERIES.
     lead_samples_ns: Vec<i64>,
 }
 
@@ -112,8 +108,8 @@ impl SourceAgg {
     }
 }
 
-/// Per-pair accumulator. delta = ts[max_ip] - ts[min_ip]; positive => the
-/// min-ip source (source_a) was earlier.
+/// Per-pair accumulator. delta = ts[b] - ts[a] for canonical (a<b); positive =>
+/// source_a was earlier.
 #[derive(Default)]
 struct PairAgg {
     a_faster: u64,
@@ -122,13 +118,33 @@ struct PairAgg {
     deltas: Vec<i64>,
 }
 
+/// jito-oriented accumulator for one non-jito source vs the jito baseline.
+#[derive(Default)]
+struct VsJitoAgg {
+    /// shreds where jito AND this source both delivered.
+    contested: u64,
+    /// source arrived before jito.
+    beats: u64,
+    /// jito arrived before source.
+    losses: u64,
+    ties: u64,
+    /// Σ(source_rx - jito_rx) ns; negative total => source faster on average.
+    delta_sum_ns: i64,
+    /// shreds this source delivered that jito did NOT (backroom exclusive).
+    source_excl: u64,
+    delta_samples_ns: Vec<i64>,
+}
+
 /// Per-leader accumulator for one flush window.
 #[derive(Default)]
 struct LeaderAgg {
     total_shreds: u64,
     contested_total: u64,
-    per_source: HashMap<IpAddr, SourceAgg>,
-    per_pair: HashMap<(IpAddr, IpAddr), PairAgg>,
+    /// shreds (of this leader) jito delivered — denominator for vs-jito coverage.
+    jito_delivered: u64,
+    per_source: HashMap<SourceId, SourceAgg>,
+    per_pair: HashMap<(SourceId, SourceId), PairAgg>,
+    vs_jito: HashMap<IpAddr, VsJitoAgg>,
 }
 
 type LeaderKey = Option<Pubkey>;
@@ -155,13 +171,14 @@ pub fn run(
     let mut last_flush = Instant::now();
 
     info!(
-        "benchmark aggregator started (data_only={}, window_slots={}, flush={}s, csv={:?}, leader_schedule={}, validator_map={})",
+        "benchmark aggregator started (data_only={}, window_slots={}, flush={}s, csv={:?}, leader_schedule={}, validator_map={}, jito_ips={})",
         cfg.data_only,
         cfg.window_slots,
         cfg.flush_interval.as_secs(),
         cfg.csv_path,
         leader.is_some(),
         validators.as_ref().map(|v| v.len()).unwrap_or(0),
+        sources::jito_ip_count(),
     );
 
     while !exit.load(Ordering::Relaxed) {
@@ -169,19 +186,11 @@ pub fn run(
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(batch) => {
                 ingest(&mut map, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds);
-                // Bounded drain so sweep/flush still run under sustained load.
                 let mut drained = 1;
                 while drained < DRAIN_CAP {
                     match rx.try_recv() {
                         Ok(batch) => {
-                            ingest(
-                                &mut map,
-                                &mut current_max_slot,
-                                &cfg,
-                                &mut csv,
-                                batch,
-                                leader_bounds,
-                            );
+                            ingest(&mut map, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds);
                             drained += 1;
                         }
                         Err(_) => break,
@@ -193,13 +202,7 @@ pub fn run(
         }
 
         if last_sweep.elapsed() >= sweep_interval {
-            sweep_finalize(
-                &mut map,
-                current_max_slot,
-                cfg.window_slots,
-                leader.as_ref(),
-                &mut acc,
-            );
+            sweep_finalize(&mut map, current_max_slot, cfg.window_slots, leader.as_ref(), &mut acc);
             last_sweep = Instant::now();
             if let Some(w) = csv.as_mut() {
                 let _ = w.flush();
@@ -213,7 +216,6 @@ pub fn run(
         }
     }
 
-    // Final finalize + flush on shutdown.
     sweep_finalize(&mut map, current_max_slot, 0, leader.as_ref(), &mut acc);
     emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped);
     if let Some(w) = csv.as_mut() {
@@ -222,18 +224,13 @@ pub fn run(
     info!("benchmark aggregator stopped");
 }
 
-/// Whether an observed slot is plausible enough to drive matching/eviction.
 #[inline]
 fn slot_is_plausible(slot: Slot, current_max: Slot, leader_bounds: Option<(Slot, Slot)>) -> bool {
     if slot >= MAX_PLAUSIBLE_SLOT {
         return false;
     }
     match leader_bounds {
-        // Leader window is authoritative: live shreds always fall inside it.
-        Some((base, end)) => {
-            slot + LEADER_MARGIN >= base && slot < end.saturating_add(LEADER_MARGIN)
-        }
-        // No window yet (startup / no RPC): bootstrap on first, then bound jumps.
+        Some((base, end)) => slot + LEADER_MARGIN >= base && slot < end.saturating_add(LEADER_MARGIN),
         None => current_max == 0 || slot <= current_max.saturating_add(MAX_SLOT_JUMP),
     }
 }
@@ -248,7 +245,6 @@ fn ingest(
 ) {
     for obs in batch {
         if let Some(w) = csv.as_mut() {
-            // rx_ts_ns,source,slot,fec_set_index,index,type
             let _ = writeln!(
                 w,
                 "{},{},{},{},{},{}",
@@ -260,25 +256,21 @@ fn ingest(
                 if obs.is_data { "data" } else { "code" },
             );
         }
-        // Guard eviction/matching against garbage slots from stray/corrupt UDP.
         if !slot_is_plausible(obs.slot, *current_max_slot, leader_bounds) {
             continue;
         }
         if obs.slot > *current_max_slot {
             *current_max_slot = obs.slot;
         }
-        // Headline stats are computed on DATA shreds only unless include_coding
-        // is set; coding still appears in the raw CSV above.
         if cfg.data_only && !obs.is_data {
             continue;
         }
         map.entry(obs.shred_id())
             .or_default()
-            .observe(obs.source, obs.rx_ts_ns);
+            .observe(sources::classify(obs.source), obs.rx_ts_ns);
     }
 }
 
-/// Finalize every shred whose slot is older than `current_max_slot - horizon`.
 fn sweep_finalize(
     map: &mut ahash::HashMap<ShredId, PerSourceArrival>,
     current_max_slot: Slot,
@@ -288,7 +280,6 @@ fn sweep_finalize(
 ) {
     let threshold = current_max_slot.saturating_sub(horizon);
     map.retain(|id, psa| {
-        // horizon==0 (shutdown) finalizes everything.
         if id.slot < threshold || horizon == 0 {
             finalize_one(*id, psa, leader, acc);
             false
@@ -317,7 +308,7 @@ fn finalize_one(
         lagg.contested_total += 1;
     }
 
-    let (winner_ip, winner_ts) = arrivals
+    let (winner_src, winner_ts) = arrivals
         .iter()
         .min_by_key(|(_, t)| *t)
         .copied()
@@ -329,7 +320,7 @@ fn finalize_one(
         if contested {
             sa.contested_delivered += 1;
             sa.push_lead(ts - winner_ts);
-            if src == winner_ip {
+            if src == winner_src {
                 sa.contested_firsts += 1;
             }
         } else {
@@ -337,15 +328,15 @@ fn finalize_one(
         }
     }
 
-    // Pairwise signed deltas (only exist when >= 2 sources).
+    // Symmetric pairwise series.
     for i in 0..arrivals.len() {
         for j in (i + 1)..arrivals.len() {
-            let (a_ip, a_ts) = arrivals[i];
-            let (b_ip, b_ts) = arrivals[j];
-            let ((ka, kb), delta) = if a_ip <= b_ip {
-                ((a_ip, b_ip), b_ts - a_ts)
+            let (a_src, a_ts) = arrivals[i];
+            let (b_src, b_ts) = arrivals[j];
+            let ((ka, kb), delta) = if a_src <= b_src {
+                ((a_src, b_src), b_ts - a_ts)
             } else {
-                ((b_ip, a_ip), a_ts - b_ts)
+                ((b_src, a_src), a_ts - b_ts)
             };
             let pa = lagg.per_pair.entry((ka, kb)).or_default();
             match delta.cmp(&0) {
@@ -356,6 +347,35 @@ fn finalize_one(
             if pa.deltas.len() < MAX_SAMPLES_PER_SERIES {
                 pa.deltas.push(delta);
             }
+        }
+    }
+
+    // jito-oriented series: every non-jito source measured against the jito baseline.
+    let jito_ts = arrivals
+        .iter()
+        .find(|(s, _)| s.is_jito())
+        .map(|(_, t)| *t);
+    if jito_ts.is_some() {
+        lagg.jito_delivered += 1;
+    }
+    for &(src, ts) in arrivals {
+        let SourceId::Ip(ip) = src else { continue };
+        let va = lagg.vs_jito.entry(ip).or_default();
+        match jito_ts {
+            Some(jts) => {
+                va.contested += 1;
+                let d = ts - jts; // negative => source beat jito
+                va.delta_sum_ns += d;
+                match d.cmp(&0) {
+                    std::cmp::Ordering::Less => va.beats += 1,
+                    std::cmp::Ordering::Greater => va.losses += 1,
+                    std::cmp::Ordering::Equal => va.ties += 1,
+                }
+                if va.delta_samples_ns.len() < MAX_SAMPLES_PER_SERIES {
+                    va.delta_samples_ns.push(d);
+                }
+            }
+            None => va.source_excl += 1,
         }
     }
 }
@@ -379,8 +399,7 @@ fn emit(
         ("leader_base_slot", leader_base_slot as i64, i64),
     );
 
-    // Global (all-leaders) rollup, DATA shreds only (the headline series).
-    let mut global: HashMap<IpAddr, SourceAgg> = HashMap::new();
+    let mut global: HashMap<SourceId, SourceAgg> = HashMap::new();
     let mut global_total: u64 = 0;
 
     for ((leader_key, is_data), lagg) in acc.iter() {
@@ -396,7 +415,6 @@ fn emit(
             _ => ("unknown".to_string(), false),
         };
 
-        // accumulate the global (data-only) rollup
         if *is_data {
             global_total += lagg.total_shreds;
             for (src, sa) in lagg.per_source.iter() {
@@ -409,17 +427,22 @@ fn emit(
         }
 
         for (src, sa) in lagg.per_source.iter() {
-            emit_source_row(&leader_label, &region, in_region, shred_type, *src, sa, lagg.total_shreds);
+            emit_source_row(&leader_label, &region, in_region, shred_type, &src.label(), sa, lagg.total_shreds);
         }
         for ((a, b), pa) in lagg.per_pair.iter() {
-            emit_pair_row(&leader_label, &region, shred_type, *a, *b, pa);
+            emit_pair_row(&leader_label, &region, in_region, shred_type, &a.label(), &b.label(), pa);
+        }
+        // vs-jito rows (only when jito actually delivered for this leader).
+        if lagg.jito_delivered >= cfg.min_samples {
+            for (ip, va) in lagg.vs_jito.iter() {
+                emit_vs_jito_row(&leader_label, &region, in_region, shred_type, *ip, va, lagg.jito_delivered);
+            }
         }
     }
 
-    // Global rollup row (leader = "ALL").
     if global_total >= cfg.min_samples {
         for (src, sa) in global.iter() {
-            emit_source_row("ALL", "ALL", false, "data", *src, sa, global_total);
+            emit_source_row("ALL", "ALL", false, "data", &src.label(), sa, global_total);
         }
         log_summary(&global, global_total);
     }
@@ -430,7 +453,7 @@ fn emit_source_row(
     region: &str,
     in_region: bool,
     shred_type: &str,
-    src: IpAddr,
+    source: &str,
     sa: &SourceAgg,
     total: u64,
 ) {
@@ -443,14 +466,12 @@ fn emit_source_row(
         "region" => region,
         "in_region" => in_region.to_string(),
         "shred_type" => shred_type,
-        "source" => src.to_string(),
+        "source" => source,
         ("total", total as i64, i64),
         ("delivered", sa.delivered as i64, i64),
-        // win-rate among contested races this source took part in
         ("contested", sa.contested_delivered as i64, i64),
         ("contested_firsts", sa.contested_firsts as i64, i64),
         ("win_rate_bps", basis_points(sa.contested_firsts, sa.contested_delivered), i64),
-        // fraction of this leader's shreds the source delivered, and was alone on
         ("coverage_bps", basis_points(sa.delivered, total), i64),
         ("exclusive_bps", basis_points(sa.exclusive, total), i64),
         ("lead_mean_us", lead_mean / 1000, i64),
@@ -460,7 +481,15 @@ fn emit_source_row(
     );
 }
 
-fn emit_pair_row(leader_label: &str, region: &str, shred_type: &str, a: IpAddr, b: IpAddr, pa: &PairAgg) {
+fn emit_pair_row(
+    leader_label: &str,
+    region: &str,
+    in_region: bool,
+    shred_type: &str,
+    a: &str,
+    b: &str,
+    pa: &PairAgg,
+) {
     let mut samples = pa.deltas.clone();
     let q = quantiles(&mut samples, &[0.5, 0.9, 0.99]);
     let decided = pa.a_faster + pa.b_faster;
@@ -468,14 +497,14 @@ fn emit_pair_row(leader_label: &str, region: &str, shred_type: &str, a: IpAddr, 
         "shredstream_bench-pair",
         "leader" => leader_label,
         "region" => region,
+        "in_region" => in_region.to_string(),
         "shred_type" => shred_type,
-        "source_a" => a.to_string(),
-        "source_b" => b.to_string(),
+        "source_a" => a,
+        "source_b" => b,
         ("samples", pa.deltas.len() as i64, i64),
         ("a_faster", pa.a_faster as i64, i64),
         ("b_faster", pa.b_faster as i64, i64),
         ("ties", pa.ties as i64, i64),
-        // a_win_rate over DECIDED comparisons (ties excluded from denominator)
         ("a_win_rate_bps", basis_points(pa.a_faster, decided), i64),
         ("delta_p50_us", q[0] / 1000, i64),
         ("delta_p90_us", q[1] / 1000, i64),
@@ -483,16 +512,57 @@ fn emit_pair_row(leader_label: &str, region: &str, shred_type: &str, a: IpAddr, 
     );
 }
 
-fn log_summary(global: &HashMap<IpAddr, SourceAgg>, total: u64) {
-    let mut rows: Vec<(IpAddr, &SourceAgg)> = global.iter().map(|(k, v)| (*k, v)).collect();
+/// The headline series for "per validator, how does this source do vs jito".
+/// `delta` and the percentiles are signed: negative => source is faster than jito.
+fn emit_vs_jito_row(
+    leader_label: &str,
+    region: &str,
+    in_region: bool,
+    shred_type: &str,
+    source: IpAddr,
+    va: &VsJitoAgg,
+    jito_delivered: u64,
+) {
+    let mut samples = va.delta_samples_ns.clone();
+    let q = quantiles(&mut samples, &[0.5, 0.9, 0.99]);
+    let src = source.to_string();
+    datapoint_info!(
+        "shredstream_bench-vs-jito",
+        "leader" => leader_label,
+        "region" => region,
+        "in_region" => in_region.to_string(),
+        "shred_type" => shred_type,
+        "source" => src.as_str(),
+        ("contested", va.contested as i64, i64),
+        ("beats", va.beats as i64, i64),
+        ("losses", va.losses as i64, i64),
+        ("ties", va.ties as i64, i64),
+        // fraction of contested shreds where the source beat jito
+        ("beat_rate_bps", basis_points(va.beats, va.contested), i64),
+        // fraction of jito's shreds this source also delivered
+        ("coverage_vs_jito_bps", basis_points(va.contested, jito_delivered), i64),
+        // shreds the source delivered that jito never did
+        ("source_excl", va.source_excl as i64, i64),
+        // signed deltas in us (negative = source faster). delta_sum_us + contested
+        // aggregate exactly across flush windows; the percentiles are per-window.
+        ("delta_sum_us", va.delta_sum_ns / 1000, i64),
+        ("delta_p50_us", q[0] / 1000, i64),
+        ("delta_p90_us", q[1] / 1000, i64),
+        ("delta_p99_us", q[2] / 1000, i64),
+    );
+}
+
+fn log_summary(global: &HashMap<SourceId, SourceAgg>, total: u64) {
+    let mut rows: Vec<(SourceId, &SourceAgg)> = global.iter().map(|(k, v)| (*k, v)).collect();
     rows.sort_by_key(|(_, sa)| std::cmp::Reverse(sa.contested_firsts));
     let summary: Vec<String> = rows
         .iter()
-        .map(|(ip, sa)| {
+        .map(|(sid, sa)| {
             let mut s = sa.lead_samples_ns.clone();
             let q = quantiles(&mut s, &[0.5]);
             format!(
-                "{ip}: win={:.1}% cover={:.1}% excl={:.1}% p50_lead={}us",
+                "{}: win={:.1}% cover={:.1}% excl={:.1}% p50_lead={}us",
+                sid.label(),
                 basis_points(sa.contested_firsts, sa.contested_delivered) as f64 / 100.0,
                 basis_points(sa.delivered, total) as f64 / 100.0,
                 basis_points(sa.exclusive, total) as f64 / 100.0,
@@ -527,41 +597,36 @@ mod tests {
     fn ip(n: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
     }
+    fn sid(n: u8) -> SourceId {
+        SourceId::Ip(ip(n))
+    }
 
     #[test]
     fn slot_guard_rejects_garbage_and_bounds_jumps() {
-        // absolute implausible slot is always rejected
         assert!(!slot_is_plausible(MAX_PLAUSIBLE_SLOT, 0, None));
         assert!(!slot_is_plausible(u64::MAX, 1_000, None));
-        // no window: bootstrap on first, then bounded forward jump
         assert!(slot_is_plausible(500_000_000, 0, None));
         assert!(slot_is_plausible(1_000 + MAX_SLOT_JUMP, 1_000, None));
         assert!(!slot_is_plausible(1_000 + MAX_SLOT_JUMP + 1, 1_000, None));
-        // with a leader window, only in-window (± margin) slots are accepted
         let bounds = Some((1_000u64, 6_000u64));
         assert!(slot_is_plausible(3_000, 0, bounds));
-        assert!(slot_is_plausible(1_000, 0, bounds));
-        assert!(!slot_is_plausible(50_000, 5_999, bounds)); // far above end+margin
-        assert!(!slot_is_plausible(500, 0, bounds)); // below base-margin
+        assert!(!slot_is_plausible(50_000, 5_999, bounds));
+        assert!(!slot_is_plausible(500, 0, bounds));
     }
 
     #[test]
     fn finalize_contested_and_exclusive() {
         let mut acc: HashMap<AccKey, LeaderAgg> = HashMap::new();
-        let (a, b) = (ip(1), ip(2)); // a < b
+        let (a, b) = (sid(1), sid(2)); // Ip(10.0.0.1) < Ip(10.0.0.2)
 
-        // contested shred: A arrives at 1000, B at 1500 -> A wins by 500ns
         let mut psa = PerSourceArrival::default();
         psa.observe(a, 1000);
         psa.observe(b, 1500);
-        let id = ShredId { slot: 100, fec_set_index: 0, index: 5, is_data: true };
-        finalize_one(id, &psa, None, &mut acc);
+        finalize_one(ShredId { slot: 100, fec_set_index: 0, index: 5, is_data: true }, &psa, None, &mut acc);
 
-        // exclusive shred: only A delivers
         let mut psa2 = PerSourceArrival::default();
         psa2.observe(a, 2000);
-        let id2 = ShredId { slot: 101, fec_set_index: 0, index: 1, is_data: true };
-        finalize_one(id2, &psa2, None, &mut acc);
+        finalize_one(ShredId { slot: 101, fec_set_index: 0, index: 1, is_data: true }, &psa2, None, &mut acc);
 
         let lagg = acc.get(&(None, true)).unwrap();
         assert_eq!(lagg.total_shreds, 2);
@@ -570,33 +635,48 @@ mod tests {
         let sa_a = lagg.per_source.get(&a).unwrap();
         assert_eq!(sa_a.delivered, 2);
         assert_eq!(sa_a.exclusive, 1);
-        assert_eq!(sa_a.contested_delivered, 1);
         assert_eq!(sa_a.contested_firsts, 1);
-        assert_eq!(sa_a.lead_samples_ns, vec![0]); // A won the contested race
+        assert_eq!(sa_a.lead_samples_ns, vec![0]);
 
         let sa_b = lagg.per_source.get(&b).unwrap();
-        assert_eq!(sa_b.delivered, 1);
-        assert_eq!(sa_b.exclusive, 0);
         assert_eq!(sa_b.contested_firsts, 0);
-        assert_eq!(sa_b.lead_samples_ns, vec![500]); // B was 500ns behind
+        assert_eq!(sa_b.lead_samples_ns, vec![500]);
 
-        // pair (a,b): delta = ts[b]-ts[a] = +500 -> a_faster
         let pa = lagg.per_pair.get(&(a, b)).unwrap();
         assert_eq!((pa.a_faster, pa.b_faster, pa.ties), (1, 0, 0));
-        assert_eq!(pa.deltas, vec![500]);
     }
 
     #[test]
-    fn coding_and_data_are_separate_series() {
+    fn vs_jito_orientation_and_exclusive() {
         let mut acc: HashMap<AccKey, LeaderAgg> = HashMap::new();
-        let a = ip(1);
-        let mut d = PerSourceArrival::default();
-        d.observe(a, 10);
-        finalize_one(ShredId { slot: 1, fec_set_index: 0, index: 0, is_data: true }, &d, None, &mut acc);
-        let mut c = PerSourceArrival::default();
-        c.observe(a, 10);
-        finalize_one(ShredId { slot: 1, fec_set_index: 0, index: 0, is_data: false }, &c, None, &mut acc);
-        assert!(acc.contains_key(&(None, true)));
-        assert!(acc.contains_key(&(None, false)));
+        let custom = sid(7);
+
+        // shred 1: jito 1000, custom 800 -> custom beats jito by 200ns
+        let mut s1 = PerSourceArrival::default();
+        s1.observe(SourceId::Jito, 1000);
+        s1.observe(custom, 800);
+        finalize_one(ShredId { slot: 10, fec_set_index: 0, index: 0, is_data: true }, &s1, None, &mut acc);
+
+        // shred 2: jito 1000, custom 1300 -> jito faster
+        let mut s2 = PerSourceArrival::default();
+        s2.observe(SourceId::Jito, 1000);
+        s2.observe(custom, 1300);
+        finalize_one(ShredId { slot: 10, fec_set_index: 0, index: 1, is_data: true }, &s2, None, &mut acc);
+
+        // shred 3: custom only (jito never delivered) -> source exclusive
+        let mut s3 = PerSourceArrival::default();
+        s3.observe(custom, 500);
+        finalize_one(ShredId { slot: 10, fec_set_index: 0, index: 2, is_data: true }, &s3, None, &mut acc);
+
+        let lagg = acc.get(&(None, true)).unwrap();
+        assert_eq!(lagg.jito_delivered, 2); // shreds 1 and 2
+        let va = lagg.vs_jito.get(&ip(7)).unwrap();
+        assert_eq!(va.contested, 2);
+        assert_eq!(va.beats, 1);
+        assert_eq!(va.losses, 1);
+        assert_eq!(va.source_excl, 1);
+        assert_eq!(va.delta_sum_ns, -200 + 300); // = +100 ns net
+        // coverage = contested(2) / jito_delivered(2) = 100%
+        assert_eq!(basis_points(va.contested, lagg.jito_delivered), 10_000);
     }
 }

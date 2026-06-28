@@ -273,3 +273,40 @@ cross-source *union*, not the leader's true output (no ground truth without full
 default userspace path uses one batch-granular timestamp — headline per-validator conclusions should use
 `--benchmark-kernel-timestamps` (§5/§13); leader pubkey as an influx tag is high-cardinality *by design*
 (per-validator is the deliverable), bounded by `--benchmark-min-samples`.
+
+---
+
+## 15. Jito baseline + consuming the data per validator (2026-06-28)
+
+**Jito is auto-identified by source IP.** `proxy/src/benchmark/sources.rs` hardcodes jito's
+block-engine shred-source IPs (from the validator firewall allowlist, ~42 IPs across
+amsterdam/frankfurt/london/ny/slc). `classify(ip)` maps any of them to a single `SourceId::Jito`
+(all PoPs collapse — jito's time for a shred is its best PoP, the min across those IPs); every other
+IP stays `SourceId::Ip(addr)` (MVP: anonymous). Updating jito's IPs requires editing that list +
+recompiling. No config needed to pick the baseline.
+
+**The headline series: `shredstream_bench-vs-jito`** — emitted per `(leader, source)` for every
+non-jito source, oriented jito→source so the sign is unambiguous:
+- tags: `leader, region, in_region, shred_type, source`
+- fields: `contested` (both jito & source delivered), `beats` (source earlier than jito), `losses`,
+  `ties`, `beat_rate_bps`, `coverage_vs_jito_bps` (= contested / jito_delivered), `source_excl`
+  (shreds the source had that jito never did — the backroom signal), `delta_sum_us` (Σ(source−jito),
+  negative ⇒ source faster), `delta_p50/p90/p99_us` (signed, per-window).
+
+**Why these fields:** counts and `delta_sum_us` aggregate exactly across flush windows, so the *true*
+long-horizon answer is a single grouped query; percentiles are per-window trends only (use the CSV for
+exact distributions). Per-validator data is temporally sparse (a validator leads ~4 slots per rotation),
+so always aggregate over hours and gate on a min `contested`.
+
+**The per-validator query** (location-relevant validators, custom vs jito, last 24h):
+```sql
+SELECT sum(beats)/sum(contested)        AS beat_rate,
+       sum(delta_sum_us)/sum(contested) AS mean_delta_us,   -- negative = source faster than jito
+       sum(source_excl)                 AS exclusive,
+       sum(contested)                   AS n
+FROM "shredstream_bench-vs-jito"
+WHERE in_region='true' AND time > now()-24h
+GROUP BY leader, source
+```
+Filter `n` above a confidence threshold, rank per leader → the validator-by-validator routing intel.
+The symmetric `shredstream_bench-pair` series remains for custom-vs-custom comparisons.
