@@ -12,6 +12,7 @@
 //! blocked.
 
 pub mod aggregator;
+pub mod influx;
 pub mod leader;
 pub mod parse;
 pub mod recv_timestamp;
@@ -94,6 +95,29 @@ pub struct BenchmarkArgs {
     /// off the listen/forward/reconstruct cores to avoid tail-latency jitter.
     #[arg(long, env)]
     pub benchmark_aggregator_core_id: Option<usize>,
+
+    /// InfluxDB v2 base URL (e.g. http://127.0.0.1:8086). When set (with org,
+    /// bucket, token) the benchmark writes its series directly via the v2 write
+    /// API — no solana-metrics / SOLANA_METRICS_CONFIG needed.
+    #[arg(long, env)]
+    pub benchmark_influx_url: Option<String>,
+
+    /// InfluxDB v2 org.
+    #[arg(long, env)]
+    pub benchmark_influx_org: Option<String>,
+
+    /// InfluxDB v2 bucket.
+    #[arg(long, env)]
+    pub benchmark_influx_bucket: Option<String>,
+
+    /// InfluxDB v2 API token.
+    #[arg(long, env)]
+    pub benchmark_influx_token: Option<String>,
+
+    /// Also emit the per-source and symmetric-pair series (default: only the
+    /// vs-jito headline series + health).
+    #[arg(long, env, default_value_t = false)]
+    pub benchmark_emit_source_pair: bool,
 }
 
 impl BenchmarkArgs {
@@ -112,6 +136,13 @@ impl BenchmarkArgs {
             channel_capacity: self.benchmark_channel_capacity.max(1),
             min_samples: self.benchmark_min_samples,
             aggregator_core_id: self.benchmark_aggregator_core_id,
+            influx: self.benchmark_influx_url.clone().map(|url| influx::InfluxConfig {
+                url,
+                org: self.benchmark_influx_org.clone().unwrap_or_default(),
+                bucket: self.benchmark_influx_bucket.clone().unwrap_or_default(),
+                token: self.benchmark_influx_token.clone().unwrap_or_default(),
+            }),
+            emit_source_pair: self.benchmark_emit_source_pair,
         }
     }
 }
@@ -131,6 +162,8 @@ pub struct BenchmarkConfig {
     pub channel_capacity: usize,
     pub min_samples: u64,
     pub aggregator_core_id: Option<usize>,
+    pub influx: Option<influx::InfluxConfig>,
+    pub emit_source_pair: bool,
 }
 
 /// Cheap, cloneable handle the ingest path uses to push observations. The only

@@ -1,8 +1,9 @@
 # Validator-Granularity Shred-Source Benchmark — Design
 
 **Branch:** `validator-benching` (based on `proven-fixes`, the production branch).
-**Status:** designed, not yet built. Build order is the phased plan in §11.
-**Author:** research workflow + synthesis, 2026-06-25.
+**Status:** built (M0–M4, TUI skipped), audited, committed to `validator-benching`. Jito auto-identified
+by IP (§15); direct InfluxDB v2 writer (§16). Not yet run against live traffic.
+**Author:** research workflow + synthesis, 2026-06-25; updated 2026-06-28.
 
 ---
 
@@ -197,9 +198,8 @@ Roll up `leader → region`.
    exclusives in the coverage metric.
 2. Do NOT copy shred-stats' descending-sort percentiles (`stats.go:130`) — its "P99" is inverted.
 
-**Sink:** InfluxDB line protocol (already running at `http://64.130.41.179:8086/`), tags
-`leader,region,source`/`source_pair`, fields `win_rate,p50_us,p99_us,n,coverage`; plus a raw per-ShredId
-CSV dump for offline analysis (cheapest first milestone).
+**Sink:** a **direct InfluxDB v2 line-protocol writer** (`influx.rs`), NOT solana-metrics — see §16.
+Plus the raw per-observation CSV (`--benchmark-csv-path`) and the periodic log summary.
 
 ---
 
@@ -310,3 +310,29 @@ GROUP BY leader, source
 ```
 Filter `n` above a confidence threshold, rank per leader → the validator-by-validator routing intel.
 The symmetric `shredstream_bench-pair` series remains for custom-vs-custom comparisons.
+
+---
+
+## 16. InfluxDB output: direct v2 writer (2026-06-28)
+
+The benchmark writes its own series **directly to InfluxDB v2**, bypassing solana-metrics entirely
+(`proxy/src/benchmark/influx.rs`). Rationale: we only want the one bench series in influx, not the
+proxy's whole `shredstream_proxy-*` datapoint set, and the node runs influx **v2** (token/org/bucket),
+not the v1 line that `SOLANA_METRICS_CONFIG` targets.
+
+- **Write path:** `POST {url}/api/v2/write?org=&bucket=&precision=ns`, header `Authorization: Token …`,
+  body = line protocol (identical across influx v1/v2/v3, so forward-compatible). One POST per flush,
+  5s timeout, errors logged + dropped (never blocks the aggregator).
+- **Config (flags or env):** `BENCHMARK_INFLUX_URL`, `BENCHMARK_INFLUX_ORG`, `BENCHMARK_INFLUX_BUCKET`,
+  `BENCHMARK_INFLUX_TOKEN`. If `URL` is unset (or any field empty) influx is disabled and only the CSV +
+  log summary are produced. The token is redacted from the startup config log.
+- **What's emitted:** by default ONLY `shredstream_bench-vs-jito` (per `(leader, source)`, the headline)
+  plus `shredstream_bench-health`, and a global `leader="ALL"` vs-jito rollup. Set
+  `--benchmark-emit-source-pair` to additionally emit `shredstream_bench-source` and
+  `shredstream_bench-pair`.
+- **Querying on v2:** Flux is native (no setup); InfluxQL works via a one-time DBRP mapping. At this
+  cardinality (~thousands of series) the per-validator `group by leader, source` is efficient. Counts and
+  `delta_sum_us` aggregate exactly across flush windows; percentiles are per-window (use the CSV for
+  exact distributions).
+- **solana-metrics** is no longer used by the benchmark (the rest of the proxy still uses it for its own
+  metrics, unchanged).

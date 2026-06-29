@@ -22,12 +22,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crossbeam_channel::Receiver;
 use log::{info, warn};
-use solana_metrics::datapoint_info;
 use solana_sdk::{clock::Slot, pubkey::Pubkey};
 
 use super::{
+    influx::{append_point, InfluxWriter},
     leader::LeaderScheduleHandle,
     parse::{Observation, ShredId},
     sources::{self, SourceId},
@@ -35,6 +37,13 @@ use super::{
     validators::ValidatorMap,
     BenchmarkConfig,
 };
+
+fn now_unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
 
 /// Slots at/above this are treated as garbage (a stray/corrupt UDP datagram with
 /// a plausible variant byte). Real mainnet slots are ~4.3e8; 2^40 (~1.1e12) is
@@ -135,6 +144,23 @@ struct VsJitoAgg {
     delta_samples_ns: Vec<i64>,
 }
 
+impl VsJitoAgg {
+    fn merge(&mut self, other: &VsJitoAgg) {
+        self.contested += other.contested;
+        self.beats += other.beats;
+        self.losses += other.losses;
+        self.ties += other.ties;
+        self.delta_sum_ns += other.delta_sum_ns;
+        self.source_excl += other.source_excl;
+        for &x in &other.delta_samples_ns {
+            if self.delta_samples_ns.len() >= MAX_SAMPLES_PER_SERIES {
+                break;
+            }
+            self.delta_samples_ns.push(x);
+        }
+    }
+}
+
 /// Per-leader accumulator for one flush window.
 #[derive(Default)]
 struct LeaderAgg {
@@ -165,6 +191,7 @@ pub fn run(
     let mut current_max_slot: Slot = 0;
 
     let mut csv = open_csv(&cfg);
+    let influx = cfg.influx.as_ref().and_then(InfluxWriter::new);
 
     let sweep_interval = Duration::from_secs(1);
     let mut last_sweep = Instant::now();
@@ -210,14 +237,14 @@ pub fn run(
         }
 
         if last_flush.elapsed() >= cfg.flush_interval {
-            emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped);
+            emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, influx.as_ref());
             acc.clear();
             last_flush = Instant::now();
         }
     }
 
     sweep_finalize(&mut map, current_max_slot, 0, leader.as_ref(), &mut acc);
-    emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped);
+    emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, influx.as_ref());
     if let Some(w) = csv.as_mut() {
         let _ = w.flush();
     }
@@ -386,21 +413,37 @@ fn emit(
     leader: Option<&LeaderScheduleHandle>,
     cfg: &BenchmarkConfig,
     dropped: &AtomicU64,
+    influx: Option<&InfluxWriter>,
 ) {
     let dropped_now = dropped.swap(0, Ordering::Relaxed);
     if dropped_now > 0 {
         warn!("benchmark dropped {dropped_now} observations since last flush (channel full)");
     }
-    let leader_base_slot = leader.and_then(|h| h.bounds()).map(|(b, _)| b).unwrap_or(0);
-    datapoint_info!(
-        "shredstream_bench-health",
-        ("dropped_observations", dropped_now as i64, i64),
-        ("series_tracked", acc.len() as i64, i64),
-        ("leader_base_slot", leader_base_slot as i64, i64),
-    );
+    let want_influx = influx.is_some();
+    let ts = now_unix_nanos();
+    let mut buf = String::new();
 
-    let mut global: HashMap<SourceId, SourceAgg> = HashMap::new();
+    if want_influx {
+        let leader_base_slot = leader.and_then(|h| h.bounds()).map(|(b, _)| b).unwrap_or(0);
+        append_point(
+            &mut buf,
+            "shredstream_bench-health",
+            &[],
+            &[
+                ("dropped_observations", dropped_now as i64),
+                ("series_tracked", acc.len() as i64),
+                ("leader_base_slot", leader_base_slot as i64),
+            ],
+            ts,
+        );
+    }
+
+    // Global (all-leaders, data-only) rollups — for the log summary and the
+    // leader="ALL" rows.
+    let mut global_source: HashMap<SourceId, SourceAgg> = HashMap::new();
     let mut global_total: u64 = 0;
+    let mut global_vs: HashMap<IpAddr, VsJitoAgg> = HashMap::new();
+    let mut global_jito_delivered: u64 = 0;
 
     for ((leader_key, is_data), lagg) in acc.iter() {
         let shred_type = if *is_data { "data" } else { "code" };
@@ -417,38 +460,60 @@ fn emit(
 
         if *is_data {
             global_total += lagg.total_shreds;
+            global_jito_delivered += lagg.jito_delivered;
             for (src, sa) in lagg.per_source.iter() {
-                global.entry(*src).or_default().merge(sa);
+                global_source.entry(*src).or_default().merge(sa);
+            }
+            for (ip, va) in lagg.vs_jito.iter() {
+                global_vs.entry(*ip).or_default().merge(va);
             }
         }
 
-        if lagg.total_shreds < cfg.min_samples {
+        if !want_influx || lagg.total_shreds < cfg.min_samples {
             continue;
         }
 
-        for (src, sa) in lagg.per_source.iter() {
-            emit_source_row(&leader_label, &region, in_region, shred_type, &src.label(), sa, lagg.total_shreds);
-        }
-        for ((a, b), pa) in lagg.per_pair.iter() {
-            emit_pair_row(&leader_label, &region, in_region, shred_type, &a.label(), &b.label(), pa);
-        }
-        // vs-jito rows (only when jito actually delivered for this leader).
+        // Headline: vs-jito rows, always emitted (when jito delivered for this leader).
         if lagg.jito_delivered >= cfg.min_samples {
             for (ip, va) in lagg.vs_jito.iter() {
-                emit_vs_jito_row(&leader_label, &region, in_region, shred_type, *ip, va, lagg.jito_delivered);
+                append_vs_jito(&mut buf, ts, &leader_label, &region, in_region, shred_type, *ip, va, lagg.jito_delivered);
+            }
+        }
+        // Optional per-source + symmetric-pair detail.
+        if cfg.emit_source_pair {
+            for (src, sa) in lagg.per_source.iter() {
+                append_source(&mut buf, ts, &leader_label, &region, in_region, shred_type, &src.label(), sa, lagg.total_shreds);
+            }
+            for ((a, b), pa) in lagg.per_pair.iter() {
+                append_pair(&mut buf, ts, &leader_label, &region, in_region, shred_type, &a.label(), &b.label(), pa);
             }
         }
     }
 
-    if global_total >= cfg.min_samples {
-        for (src, sa) in global.iter() {
-            emit_source_row("ALL", "ALL", false, "data", &src.label(), sa, global_total);
+    // Global rollup rows (leader = "ALL").
+    if want_influx && global_jito_delivered >= cfg.min_samples {
+        for (ip, va) in global_vs.iter() {
+            append_vs_jito(&mut buf, ts, "ALL", "ALL", false, "data", *ip, va, global_jito_delivered);
         }
-        log_summary(&global, global_total);
+    }
+    if want_influx && cfg.emit_source_pair && global_total >= cfg.min_samples {
+        for (src, sa) in global_source.iter() {
+            append_source(&mut buf, ts, "ALL", "ALL", false, "data", &src.label(), sa, global_total);
+        }
+    }
+
+    if let Some(w) = influx {
+        w.write(&buf);
+    }
+    if global_total >= cfg.min_samples {
+        log_summary(&global_source, global_total);
     }
 }
 
-fn emit_source_row(
+#[allow(clippy::too_many_arguments)]
+fn append_source(
+    buf: &mut String,
+    ts: u128,
     leader_label: &str,
     region: &str,
     in_region: bool,
@@ -460,28 +525,38 @@ fn emit_source_row(
     let mut samples = sa.lead_samples_ns.clone();
     let q = quantiles(&mut samples, &[0.5, 0.9, 0.99]);
     let lead_mean = mean(&samples);
-    datapoint_info!(
+    let in_region_s = in_region.to_string();
+    append_point(
+        buf,
         "shredstream_bench-source",
-        "leader" => leader_label,
-        "region" => region,
-        "in_region" => in_region.to_string(),
-        "shred_type" => shred_type,
-        "source" => source,
-        ("total", total as i64, i64),
-        ("delivered", sa.delivered as i64, i64),
-        ("contested", sa.contested_delivered as i64, i64),
-        ("contested_firsts", sa.contested_firsts as i64, i64),
-        ("win_rate_bps", basis_points(sa.contested_firsts, sa.contested_delivered), i64),
-        ("coverage_bps", basis_points(sa.delivered, total), i64),
-        ("exclusive_bps", basis_points(sa.exclusive, total), i64),
-        ("lead_mean_us", lead_mean / 1000, i64),
-        ("lead_p50_us", q[0] / 1000, i64),
-        ("lead_p90_us", q[1] / 1000, i64),
-        ("lead_p99_us", q[2] / 1000, i64),
+        &[
+            ("leader", leader_label),
+            ("region", region),
+            ("in_region", in_region_s.as_str()),
+            ("shred_type", shred_type),
+            ("source", source),
+        ],
+        &[
+            ("total", total as i64),
+            ("delivered", sa.delivered as i64),
+            ("contested", sa.contested_delivered as i64),
+            ("contested_firsts", sa.contested_firsts as i64),
+            ("win_rate_bps", basis_points(sa.contested_firsts, sa.contested_delivered)),
+            ("coverage_bps", basis_points(sa.delivered, total)),
+            ("exclusive_bps", basis_points(sa.exclusive, total)),
+            ("lead_mean_us", lead_mean / 1000),
+            ("lead_p50_us", q[0] / 1000),
+            ("lead_p90_us", q[1] / 1000),
+            ("lead_p99_us", q[2] / 1000),
+        ],
+        ts,
     );
 }
 
-fn emit_pair_row(
+#[allow(clippy::too_many_arguments)]
+fn append_pair(
+    buf: &mut String,
+    ts: u128,
     leader_label: &str,
     region: &str,
     in_region: bool,
@@ -493,28 +568,38 @@ fn emit_pair_row(
     let mut samples = pa.deltas.clone();
     let q = quantiles(&mut samples, &[0.5, 0.9, 0.99]);
     let decided = pa.a_faster + pa.b_faster;
-    datapoint_info!(
+    let in_region_s = in_region.to_string();
+    append_point(
+        buf,
         "shredstream_bench-pair",
-        "leader" => leader_label,
-        "region" => region,
-        "in_region" => in_region.to_string(),
-        "shred_type" => shred_type,
-        "source_a" => a,
-        "source_b" => b,
-        ("samples", pa.deltas.len() as i64, i64),
-        ("a_faster", pa.a_faster as i64, i64),
-        ("b_faster", pa.b_faster as i64, i64),
-        ("ties", pa.ties as i64, i64),
-        ("a_win_rate_bps", basis_points(pa.a_faster, decided), i64),
-        ("delta_p50_us", q[0] / 1000, i64),
-        ("delta_p90_us", q[1] / 1000, i64),
-        ("delta_p99_us", q[2] / 1000, i64),
+        &[
+            ("leader", leader_label),
+            ("region", region),
+            ("in_region", in_region_s.as_str()),
+            ("shred_type", shred_type),
+            ("source_a", a),
+            ("source_b", b),
+        ],
+        &[
+            ("samples", pa.deltas.len() as i64),
+            ("a_faster", pa.a_faster as i64),
+            ("b_faster", pa.b_faster as i64),
+            ("ties", pa.ties as i64),
+            ("a_win_rate_bps", basis_points(pa.a_faster, decided)),
+            ("delta_p50_us", q[0] / 1000),
+            ("delta_p90_us", q[1] / 1000),
+            ("delta_p99_us", q[2] / 1000),
+        ],
+        ts,
     );
 }
 
 /// The headline series for "per validator, how does this source do vs jito".
-/// `delta` and the percentiles are signed: negative => source is faster than jito.
-fn emit_vs_jito_row(
+/// `delta_sum_us` and the percentiles are signed: negative => source faster than jito.
+#[allow(clippy::too_many_arguments)]
+fn append_vs_jito(
+    buf: &mut String,
+    ts: u128,
     leader_label: &str,
     region: &str,
     in_region: bool,
@@ -525,30 +610,32 @@ fn emit_vs_jito_row(
 ) {
     let mut samples = va.delta_samples_ns.clone();
     let q = quantiles(&mut samples, &[0.5, 0.9, 0.99]);
+    let in_region_s = in_region.to_string();
     let src = source.to_string();
-    datapoint_info!(
+    append_point(
+        buf,
         "shredstream_bench-vs-jito",
-        "leader" => leader_label,
-        "region" => region,
-        "in_region" => in_region.to_string(),
-        "shred_type" => shred_type,
-        "source" => src.as_str(),
-        ("contested", va.contested as i64, i64),
-        ("beats", va.beats as i64, i64),
-        ("losses", va.losses as i64, i64),
-        ("ties", va.ties as i64, i64),
-        // fraction of contested shreds where the source beat jito
-        ("beat_rate_bps", basis_points(va.beats, va.contested), i64),
-        // fraction of jito's shreds this source also delivered
-        ("coverage_vs_jito_bps", basis_points(va.contested, jito_delivered), i64),
-        // shreds the source delivered that jito never did
-        ("source_excl", va.source_excl as i64, i64),
-        // signed deltas in us (negative = source faster). delta_sum_us + contested
-        // aggregate exactly across flush windows; the percentiles are per-window.
-        ("delta_sum_us", va.delta_sum_ns / 1000, i64),
-        ("delta_p50_us", q[0] / 1000, i64),
-        ("delta_p90_us", q[1] / 1000, i64),
-        ("delta_p99_us", q[2] / 1000, i64),
+        &[
+            ("leader", leader_label),
+            ("region", region),
+            ("in_region", in_region_s.as_str()),
+            ("shred_type", shred_type),
+            ("source", src.as_str()),
+        ],
+        &[
+            ("contested", va.contested as i64),
+            ("beats", va.beats as i64),
+            ("losses", va.losses as i64),
+            ("ties", va.ties as i64),
+            ("beat_rate_bps", basis_points(va.beats, va.contested)),
+            ("coverage_vs_jito_bps", basis_points(va.contested, jito_delivered)),
+            ("source_excl", va.source_excl as i64),
+            ("delta_sum_us", va.delta_sum_ns / 1000),
+            ("delta_p50_us", q[0] / 1000),
+            ("delta_p90_us", q[1] / 1000),
+            ("delta_p99_us", q[2] / 1000),
+        ],
+        ts,
     );
 }
 
