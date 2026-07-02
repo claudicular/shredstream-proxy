@@ -13,9 +13,19 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     sync::OnceLock,
 };
+
+/// Sentinel source address stamped on observations that arrive via the
+/// DoubleZero multicast listener. DoubleZero delivers leader shreds over a
+/// multicast group on a dedicated interface, so a DoubleZero shred is identified
+/// by INGRESS (the multicast listen socket), not by packet source IP — which on
+/// the multicast path is not a stable per-source identifier. The multicast
+/// listen thread stamps this reserved address and `classify` maps it to
+/// `SourceId::DoubleZero`. Uses the RFC 5737 TEST-NET-1 range, which never
+/// appears as a real shred source.
+pub const DOUBLEZERO_SENTINEL: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
 /// (ip, jito region/city) for every known jito shred-source IP.
 const JITO_SHRED_SOURCES: &[(&str, &str)] = &[
@@ -108,10 +118,13 @@ pub fn jito_region(ip: IpAddr) -> Option<&'static str> {
 }
 
 /// Logical source identity used for matching/stats. All jito PoPs collapse into
-/// `Jito` (the baseline); everything else is its raw IP.
+/// `Jito` (the baseline); shreds arriving via the DoubleZero multicast listener
+/// collapse into `DoubleZero` (identified by ingress, see `DOUBLEZERO_SENTINEL`);
+/// everything else is its raw IP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SourceId {
     Jito,
+    DoubleZero,
     Ip(IpAddr),
 }
 
@@ -121,19 +134,23 @@ impl SourceId {
         matches!(self, SourceId::Jito)
     }
 
-    /// Tag/label form: "jito" or the dotted IP.
+    /// Tag/label form: "jito", "doublezero", or the dotted IP.
     pub fn label(&self) -> String {
         match self {
             SourceId::Jito => "jito".to_string(),
+            SourceId::DoubleZero => "doublezero".to_string(),
             SourceId::Ip(ip) => ip.to_string(),
         }
     }
 }
 
-/// Classify a packet's source IP into a `SourceId`.
+/// Classify a packet's source IP into a `SourceId`. The DoubleZero sentinel is
+/// checked first (it is stamped by the multicast listener, not a real IP).
 #[inline]
 pub fn classify(ip: IpAddr) -> SourceId {
-    if is_jito(ip) {
+    if ip == DOUBLEZERO_SENTINEL {
+        SourceId::DoubleZero
+    } else if is_jito(ip) {
         SourceId::Jito
     } else {
         SourceId::Ip(ip)
@@ -175,5 +192,15 @@ mod tests {
         // 64.130.50.14 appears twice in the source list; the set dedups it.
         assert!(jito_ip_count() >= 40 && jito_ip_count() <= 43);
         assert_eq!(SourceId::Jito.label(), "jito");
+    }
+
+    #[test]
+    fn doublezero_sentinel_classifies() {
+        // The multicast listener stamps DOUBLEZERO_SENTINEL; it must classify to
+        // DoubleZero (not jito, not a raw IP) and never collide with a real source.
+        assert_eq!(classify(DOUBLEZERO_SENTINEL), SourceId::DoubleZero);
+        assert!(!is_jito(DOUBLEZERO_SENTINEL));
+        assert_eq!(SourceId::DoubleZero.label(), "doublezero");
+        assert!(!SourceId::DoubleZero.is_jito());
     }
 }

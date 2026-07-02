@@ -80,6 +80,12 @@ pub fn start_forwarder_threads(
         panic!("Failed to bind listener sockets. Check that port {src_port} is not in use.")
     });
 
+    // The unicast listen sockets come first in the chain below; multicast sockets
+    // (DoubleZero) are appended after them. Sockets at index >= this are the
+    // DoubleZero multicast listeners, whose benchmark observations are attributed
+    // to `SourceId::DoubleZero` (by ingress) rather than by packet source IP.
+    let n_unicast_sockets = sockets.len();
+
     let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
 
@@ -151,6 +157,13 @@ pub fn start_forwarder_threads(
         .enumerate()
         .flat_map(|(thread_id, incoming_shred_socket)| {
             let (packet_sender, packet_receiver) = crossbeam_channel::unbounded();
+            // Sockets appended after the unicast ones are the DoubleZero multicast
+            // listeners; attribute their observations to SourceId::DoubleZero.
+            let bench_source_override = if thread_id >= n_unicast_sockets {
+                Some(crate::benchmark::sources::DOUBLEZERO_SENTINEL)
+            } else {
+                None
+            };
             // When kernel timestamps are enabled, use the timestamped recv path
             // which taps the benchmark in the listen thread (closest to receipt)
             // and forwards the PacketBatch downstream unchanged. Otherwise use the
@@ -163,6 +176,7 @@ pub fn start_forwarder_threads(
                     packet_sender,
                     forward_stats.clone(),
                     bh.clone(),
+                    bench_source_override,
                 ),
                 _ => streamer::receiver(
                     format!("ssListen{thread_id}"),
@@ -220,6 +234,7 @@ pub fn start_forwarder_threads(
                                     debug_trace_shred,
                                     &metrics,
                                     send_bench_handle.as_ref(),
+                                    bench_source_override,
                                 );
 
                                 // If the channel is closed or error, break out
@@ -261,6 +276,7 @@ fn recv_from_channel_and_send_multiple_dest(
     debug_trace_shred: bool,
     metrics: &ShredMetrics,
     bench: Option<&crate::benchmark::BenchmarkHandle>,
+    bench_source_override: Option<IpAddr>,
 ) -> Result<(), ShredstreamProxyError> {
     let packet_batch = maybe_packet_batch.map_err(ShredstreamProxyError::RecvError)?;
     let trace_shred_received_time = SystemTime::now();
@@ -286,7 +302,7 @@ fn recv_from_channel_and_send_multiple_dest(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
-        bench.observe_batch(&packet_batch, rx_ts_ns);
+        bench.observe_batch_as(&packet_batch, rx_ts_ns, bench_source_override);
     }
 
     let mut packet_batch_vec = vec![packet_batch];
@@ -745,6 +761,7 @@ mod tests {
             &reconstruct_tx,
             false,
             &Arc::new(ShredMetrics::default()),
+            None,
             None,
         )
         .unwrap();

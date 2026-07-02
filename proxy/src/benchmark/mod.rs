@@ -21,6 +21,7 @@ pub mod stats;
 pub mod validators;
 
 use std::{
+    net::IpAddr,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -179,10 +180,24 @@ impl BenchmarkHandle {
     /// Tap an entire batch with a single (userspace) receive timestamp. Used by
     /// the send-thread tap when kernel timestamps are disabled.
     pub fn observe_batch(&self, batch: &PacketBatch, rx_ts_ns: i64) {
+        self.observe_batch_as(batch, rx_ts_ns, None);
+    }
+
+    /// As `observe_batch`, but when `source_override` is `Some`, every packet is
+    /// attributed to that address instead of its packet source IP. Used for the
+    /// DoubleZero multicast listener, where the source is identified by ingress
+    /// (the multicast socket), not by packet source IP.
+    pub fn observe_batch_as(
+        &self,
+        batch: &PacketBatch,
+        rx_ts_ns: i64,
+        source_override: Option<IpAddr>,
+    ) {
         let mut obs = Vec::with_capacity(batch.len());
         for pkt in batch.iter() {
             if let Some(data) = pkt.data(..) {
-                if let Some(o) = parse::parse_observation(data, pkt.meta().addr, rx_ts_ns) {
+                let src = source_override.unwrap_or_else(|| pkt.meta().addr);
+                if let Some(o) = parse::parse_observation(data, src, rx_ts_ns) {
                     obs.push(o);
                 }
             }
@@ -193,10 +208,22 @@ impl BenchmarkHandle {
     /// Tap packets with per-packet kernel timestamps. Used by the timestamped
     /// recv thread. `ts[i]` corresponds to `packets[i]`.
     pub fn observe_packets(&self, packets: &[Packet], ts: &[i64]) {
+        self.observe_packets_as(packets, ts, None);
+    }
+
+    /// As `observe_packets`, but with an optional `source_override` (see
+    /// `observe_batch_as`) for the DoubleZero multicast listener.
+    pub fn observe_packets_as(
+        &self,
+        packets: &[Packet],
+        ts: &[i64],
+        source_override: Option<IpAddr>,
+    ) {
         let mut obs = Vec::with_capacity(packets.len());
         for (pkt, &t) in packets.iter().zip(ts.iter()) {
             if let Some(data) = pkt.data(..) {
-                if let Some(o) = parse::parse_observation(data, pkt.meta().addr, t) {
+                let src = source_override.unwrap_or_else(|| pkt.meta().addr);
+                if let Some(o) = parse::parse_observation(data, src, t) {
                     obs.push(o);
                 }
             }

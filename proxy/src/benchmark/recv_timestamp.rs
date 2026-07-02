@@ -30,7 +30,7 @@ use {
     solana_streamer::streamer::StreamerReceiveStats,
     std::{
         cmp, io,
-        net::UdpSocket,
+        net::{IpAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -264,6 +264,10 @@ pub fn start_recv_and_tap_thread(
     sender: crossbeam_channel::Sender<PacketBatch>,
     stats: Arc<StreamerReceiveStats>,
     bench: BenchmarkHandle,
+    // When `Some`, attribute every observed packet on this socket to the given
+    // address (DoubleZero multicast listener, identified by ingress). `None` for
+    // the normal unicast listen sockets (attributed by packet source IP).
+    bench_source_override: Option<IpAddr>,
 ) -> JoinHandle<()> {
     socket
         .set_read_timeout(Some(Duration::new(1, 0)))
@@ -333,7 +337,11 @@ pub fn start_recv_and_tap_thread(
 
                     // Tap the benchmark with per-packet kernel timestamps BEFORE
                     // forwarding (closest to true receipt). Read-only over the batch.
-                    bench.observe_packets(&batch[..total_packets], &ts_buf[..total_packets]);
+                    bench.observe_packets_as(
+                        &batch[..total_packets],
+                        &ts_buf[..total_packets],
+                        bench_source_override,
+                    );
 
                     stats
                         .packets_count

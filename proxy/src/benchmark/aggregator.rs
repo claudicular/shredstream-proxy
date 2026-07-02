@@ -14,7 +14,6 @@
 use std::{
     collections::HashMap,
     io::{BufWriter, Write},
-    net::IpAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -170,7 +169,9 @@ struct LeaderAgg {
     jito_delivered: u64,
     per_source: HashMap<SourceId, SourceAgg>,
     per_pair: HashMap<(SourceId, SourceId), PairAgg>,
-    vs_jito: HashMap<IpAddr, VsJitoAgg>,
+    /// Keyed by the non-jito source (any custom IP source, or DoubleZero). jito
+    /// is the baseline and never a key here.
+    vs_jito: HashMap<SourceId, VsJitoAgg>,
 }
 
 type LeaderKey = Option<Pubkey>;
@@ -386,8 +387,10 @@ fn finalize_one(
         lagg.jito_delivered += 1;
     }
     for &(src, ts) in arrivals {
-        let SourceId::Ip(ip) = src else { continue };
-        let va = lagg.vs_jito.entry(ip).or_default();
+        if src.is_jito() {
+            continue;
+        }
+        let va = lagg.vs_jito.entry(src).or_default();
         match jito_ts {
             Some(jts) => {
                 va.contested += 1;
@@ -442,7 +445,7 @@ fn emit(
     // leader="ALL" rows.
     let mut global_source: HashMap<SourceId, SourceAgg> = HashMap::new();
     let mut global_total: u64 = 0;
-    let mut global_vs: HashMap<IpAddr, VsJitoAgg> = HashMap::new();
+    let mut global_vs: HashMap<SourceId, VsJitoAgg> = HashMap::new();
     let mut global_jito_delivered: u64 = 0;
 
     for ((leader_key, is_data), lagg) in acc.iter() {
@@ -464,8 +467,8 @@ fn emit(
             for (src, sa) in lagg.per_source.iter() {
                 global_source.entry(*src).or_default().merge(sa);
             }
-            for (ip, va) in lagg.vs_jito.iter() {
-                global_vs.entry(*ip).or_default().merge(va);
+            for (src, va) in lagg.vs_jito.iter() {
+                global_vs.entry(*src).or_default().merge(va);
             }
         }
 
@@ -475,8 +478,8 @@ fn emit(
 
         // Headline: vs-jito rows, always emitted (when jito delivered for this leader).
         if lagg.jito_delivered >= cfg.min_samples {
-            for (ip, va) in lagg.vs_jito.iter() {
-                append_vs_jito(&mut buf, ts, &leader_label, &region, in_region, shred_type, *ip, va, lagg.jito_delivered);
+            for (src, va) in lagg.vs_jito.iter() {
+                append_vs_jito(&mut buf, ts, &leader_label, &region, in_region, shred_type, *src, va, lagg.jito_delivered);
             }
         }
         // Optional per-source + symmetric-pair detail.
@@ -492,8 +495,8 @@ fn emit(
 
     // Global rollup rows (leader = "ALL").
     if want_influx && global_jito_delivered >= cfg.min_samples {
-        for (ip, va) in global_vs.iter() {
-            append_vs_jito(&mut buf, ts, "ALL", "ALL", false, "data", *ip, va, global_jito_delivered);
+        for (src, va) in global_vs.iter() {
+            append_vs_jito(&mut buf, ts, "ALL", "ALL", false, "data", *src, va, global_jito_delivered);
         }
     }
     if want_influx && cfg.emit_source_pair && global_total >= cfg.min_samples {
@@ -604,14 +607,14 @@ fn append_vs_jito(
     region: &str,
     in_region: bool,
     shred_type: &str,
-    source: IpAddr,
+    source: SourceId,
     va: &VsJitoAgg,
     jito_delivered: u64,
 ) {
     let mut samples = va.delta_samples_ns.clone();
     let q = quantiles(&mut samples, &[0.5, 0.9, 0.99]);
     let in_region_s = in_region.to_string();
-    let src = source.to_string();
+    let src = source.label();
     append_point(
         buf,
         "shredstream_bench-vs-jito",
@@ -679,7 +682,7 @@ fn open_csv(cfg: &BenchmarkConfig) -> Option<BufWriter<std::fs::File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn ip(n: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
@@ -757,7 +760,7 @@ mod tests {
 
         let lagg = acc.get(&(None, true)).unwrap();
         assert_eq!(lagg.jito_delivered, 2); // shreds 1 and 2
-        let va = lagg.vs_jito.get(&ip(7)).unwrap();
+        let va = lagg.vs_jito.get(&sid(7)).unwrap();
         assert_eq!(va.contested, 2);
         assert_eq!(va.beats, 1);
         assert_eq!(va.losses, 1);
@@ -765,5 +768,26 @@ mod tests {
         assert_eq!(va.delta_sum_ns, -200 + 300); // = +100 ns net
         // coverage = contested(2) / jito_delivered(2) = 100%
         assert_eq!(basis_points(va.contested, lagg.jito_delivered), 10_000);
+    }
+
+    #[test]
+    fn doublezero_measured_vs_jito() {
+        // DoubleZero (identified by ingress, not IP) must flow through the
+        // generalized vs-jito series just like any custom IP source.
+        let mut acc: HashMap<AccKey, LeaderAgg> = HashMap::new();
+
+        // jito 1000, doublezero 700 -> doublezero beats jito by 300ns
+        let mut s = PerSourceArrival::default();
+        s.observe(SourceId::Jito, 1000);
+        s.observe(SourceId::DoubleZero, 700);
+        finalize_one(ShredId { slot: 5, fec_set_index: 0, index: 0, is_data: true }, &s, None, &mut acc);
+
+        let lagg = acc.get(&(None, true)).unwrap();
+        let va = lagg.vs_jito.get(&SourceId::DoubleZero).unwrap();
+        assert_eq!(va.contested, 1);
+        assert_eq!(va.beats, 1);
+        assert_eq!(va.delta_sum_ns, -300);
+        // jito is the baseline; it must never be a vs_jito key.
+        assert!(lagg.vs_jito.get(&SourceId::Jito).is_none());
     }
 }
