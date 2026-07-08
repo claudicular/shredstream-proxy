@@ -70,8 +70,15 @@ const PIPELINE_MAX_PLAUSIBLE_NS: i64 = 200_000_000; // 200ms
 /// index absent from the arrival map reliably means "unobserved" (FEC-recovered or
 /// dropped) rather than "the drain hasn't caught up yet". Must stay far below
 /// `window_slots` (the arrival-map eviction horizon) so the observations are still
-/// present when we join.
-const PUBLISH_DEFER_SLOTS: u64 = 3;
+/// present when we join — enforced by clamping `window_slots >= this + 1` in
+/// `BenchmarkArgs::to_config`.
+pub const PUBLISH_DEFER_SLOTS: u64 = 3;
+/// Hard cap on the deferral buffer so a stalled frontier (e.g. a stale leader
+/// window that rejects every observation while reconstruct keeps publishing) can
+/// never grow it without bound and OOM the process. Normal in-flight depth is a few
+/// slots' worth of published entries (~hundreds); this is vast headroom (~2 MB of
+/// 32-byte events). Overflow drops the event and counts it in `pipeline_dropped`.
+const PENDING_PUBLISH_CAP: usize = 65_536;
 
 /// Reported by the reconstruct thread each time it publishes one `Vec<Entry>`. The
 /// aggregator joins it against observed per-shred arrival timestamps
@@ -392,7 +399,14 @@ pub fn run(
             while drained < DRAIN_CAP {
                 match prx.try_recv() {
                     Ok(ev) => {
-                        pending_publish.push(ev);
+                        // Bound the buffer: if the frontier has stalled (so nothing
+                        // ripens), drop rather than grow without bound. Counted so the
+                        // loss is visible in the `meta` row.
+                        if pending_publish.len() >= PENDING_PUBLISH_CAP {
+                            pipeline_dropped.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            pending_publish.push(ev);
+                        }
                         drained += 1;
                     }
                     Err(_) => break,

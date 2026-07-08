@@ -139,7 +139,12 @@ impl BenchmarkArgs {
             validator_map_path: self.validator_map_path.clone(),
             node_country: self.node_country.clone(),
             region_max_rtt_us: self.region_max_rtt_us,
-            window_slots: self.benchmark_window_slots,
+            // Clamp so the pipeline-latency deferral's join-before-eviction invariant
+            // holds (arrival map must still hold a deferred event's slot when it
+            // ripens); a value <= PUBLISH_DEFER_SLOTS would silently zero that metric.
+            window_slots: self
+                .benchmark_window_slots
+                .max(aggregator::PUBLISH_DEFER_SLOTS + 1),
             flush_interval: Duration::from_secs(self.benchmark_flush_secs.max(1)),
             channel_capacity: self.benchmark_channel_capacity.max(1),
             min_samples: self.benchmark_min_samples,
