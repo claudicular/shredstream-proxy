@@ -65,6 +65,13 @@ const DRAIN_CAP: usize = 4_096;
 /// step / CLOCK_REALTIME jump) instead of poisoning the percentiles. Well above any
 /// real reconstruct latency, well under a slot (400ms).
 const PIPELINE_MAX_PLAUSIBLE_NS: i64 = 200_000_000; // 200ms
+/// Defer joining a publish event until its slot is this many slots behind the
+/// frontier. By then every composing shred's observation has been ingested, so an
+/// index absent from the arrival map reliably means "unobserved" (FEC-recovered or
+/// dropped) rather than "the drain hasn't caught up yet". Must stay far below
+/// `window_slots` (the arrival-map eviction horizon) so the observations are still
+/// present when we join.
+const PUBLISH_DEFER_SLOTS: u64 = 3;
 
 /// Reported by the reconstruct thread each time it publishes one `Vec<Entry>`. The
 /// aggregator joins it against observed per-shred arrival timestamps
@@ -83,36 +90,56 @@ pub struct PublishEvent {
     pub publish_ts_ns: i64,
 }
 
-/// Per-flush pipeline-latency accumulators (`debt = T_publish - T_ready`,
-/// `spread = T_ready - T_first`), split into `clean` (every composing shred was
-/// observed) and `recovered` (>=1 composing shred was FEC-recovered / unobserved).
+/// One latency distribution: a reservoir sample for percentiles + an exact running
+/// max and count that are independent of the sampling cap (so `max`/`n` stay true
+/// even after the reservoir fills, and late-window tail spikes still land in the
+/// percentiles via reservoir replacement).
 #[derive(Default)]
-struct PipelineAcc {
-    clean_n: u64,
-    clean_debt_ns: Vec<i64>,
-    clean_spread_ns: Vec<i64>,
-    recovered_n: u64,
-    recovered_debt_ns: Vec<i64>,
-    clock_anomalies: u64,
-    unknown_start_excluded: u64,
+struct LatSeries {
+    n: u64,
+    max_ns: i64,
+    samples: Vec<i64>,
 }
 
-impl PipelineAcc {
-    fn push_clean(&mut self, debt_ns: i64, spread_ns: i64) {
-        self.clean_n += 1;
-        if self.clean_debt_ns.len() < MAX_SAMPLES_PER_SERIES {
-            self.clean_debt_ns.push(debt_ns);
+impl LatSeries {
+    fn push(&mut self, v: i64, rng: &mut impl rand::Rng) {
+        self.n += 1;
+        if self.n == 1 || v > self.max_ns {
+            self.max_ns = v;
         }
-        if self.clean_spread_ns.len() < MAX_SAMPLES_PER_SERIES {
-            self.clean_spread_ns.push(spread_ns);
+        if self.samples.len() < MAX_SAMPLES_PER_SERIES {
+            self.samples.push(v);
+        } else {
+            // Reservoir sampling (Algorithm R): keep a uniform sample of all `n`.
+            let j = rng.gen_range(0..self.n);
+            if (j as usize) < MAX_SAMPLES_PER_SERIES {
+                self.samples[j as usize] = v;
+            }
         }
     }
-    fn push_recovered(&mut self, debt_ns: i64) {
-        self.recovered_n += 1;
-        if self.recovered_debt_ns.len() < MAX_SAMPLES_PER_SERIES {
-            self.recovered_debt_ns.push(debt_ns);
-        }
+    fn quantiles_us(&self) -> [i64; 3] {
+        let mut s = self.samples.clone();
+        let q = quantiles(&mut s, &[0.5, 0.9, 0.99]);
+        [q[0] / 1000, q[1] / 1000, q[2] / 1000]
     }
+}
+
+/// Per-flush pipeline-latency accumulators. `clean` = every composing shred was
+/// observed (`debt = T_publish - T_ready`, `spread = T_ready - T_first`).
+/// `incomplete` = >=1 composing index was ABSENT from the arrival map — FEC-recovered
+/// OR its observation was dropped/lost — but >=1 was observed, so a lower-confidence
+/// (over-estimated) debt is still measurable. `no_anchor` = no composing index was
+/// observed at all (no debt). The `incomplete`/`no_anchor` split intentionally does
+/// NOT claim to be pure FEC recovery; the `-pipeline` meta row surfaces the
+/// observation-drop / cmsg-missing counts so operators can discount it.
+#[derive(Default)]
+struct PipelineAcc {
+    clean_debt: LatSeries,
+    clean_spread: LatSeries,
+    incomplete_debt: LatSeries,
+    no_anchor_n: u64,
+    clock_anomalies: u64,
+    unknown_start_excluded: u64,
 }
 
 /// Join one publish event against the observed arrival map and fold the resulting
@@ -121,6 +148,7 @@ fn process_publish_event(
     ev: &PublishEvent,
     data_rx: &ahash::HashMap<(Slot, u32), i64>,
     acc: &mut PipelineAcc,
+    rng: &mut impl rand::Rng,
 ) {
     // Guessed left boundary => composing set is uncertain; exclude.
     if ev.unknown_start {
@@ -129,7 +157,7 @@ fn process_publish_event(
     }
     let mut min_rx = i64::MAX;
     let mut max_rx = i64::MIN;
-    let mut missing = false; // >=1 composing index was never observed (recovered)
+    let mut missing = false; // >=1 composing index was absent from the arrival map
     for idx in ev.start_index..=ev.end_index {
         match data_rx.get(&(ev.slot, idx)) {
             Some(&t) => {
@@ -144,9 +172,9 @@ fn process_publish_event(
         }
     }
     if max_rx == i64::MIN {
-        // No composing index was observed (fully recovered, or evicted). Count it
-        // but we have no arrival anchor to measure against.
-        acc.recovered_n += 1;
+        // No composing index observed (fully recovered, all dropped, or evicted):
+        // no arrival anchor to measure against.
+        acc.no_anchor_n += 1;
         return;
     }
     // T_ready = max availability over composing shreds; among observed shreds that
@@ -158,11 +186,18 @@ fn process_publish_event(
     }
     if missing {
         // Approximate: the true completion may be a coding-shred arrival we don't
-        // track here, so this under-estimates T_ready (over-estimates debt).
-        acc.push_recovered(debt);
+        // track here (or a dropped observation), so this can over-estimate debt.
+        acc.incomplete_debt.push(debt, rng);
     } else {
         let spread = max_rx - min_rx; // >= 0
-        acc.push_clean(debt, spread);
+        // spread shares the CLOCK_REALTIME domain; guard it like debt so a clock
+        // step between the first and last intra-batch arrival can't poison it.
+        if !(0..=PIPELINE_MAX_PLAUSIBLE_NS).contains(&spread) {
+            acc.clock_anomalies += 1;
+            return;
+        }
+        acc.clean_debt.push(debt, rng);
+        acc.clean_spread.push(spread, rng);
     }
 }
 
@@ -305,6 +340,10 @@ pub fn run(
     let pipeline_on = pipeline_rx.is_some();
     let mut data_rx: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
     let mut pipeline_acc = PipelineAcc::default();
+    // Publish events buffered until their slot is `PUBLISH_DEFER_SLOTS` behind the
+    // frontier, so the join sees a fully-ingested arrival map (no drain-order race).
+    let mut pending_publish: Vec<PublishEvent> = Vec::new();
+    let mut rng = rand::thread_rng();
 
     let mut csv = open_csv(&cfg);
     let influx = cfg.influx.as_ref().and_then(InfluxWriter::new);
@@ -344,20 +383,30 @@ pub fn run(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Drain publish events and join them against the (already up-to-date)
-        // arrival map. A batch's shreds were observed at arrival, long before its
-        // publish event, so their `rx` is present in `data_rx` here.
+        // Buffer publish events, then join only those whose slot is
+        // `PUBLISH_DEFER_SLOTS` behind the frontier — by then all their shreds'
+        // observations have been ingested, so an index absent from `data_rx`
+        // reliably means unobserved, not a drain-order race.
         if let Some(prx) = pipeline_rx.as_ref() {
             let mut drained = 0;
             while drained < DRAIN_CAP {
                 match prx.try_recv() {
                     Ok(ev) => {
-                        process_publish_event(&ev, &data_rx, &mut pipeline_acc);
+                        pending_publish.push(ev);
                         drained += 1;
                     }
                     Err(_) => break,
                 }
             }
+            let ready_threshold = current_max_slot.saturating_sub(PUBLISH_DEFER_SLOTS);
+            pending_publish.retain(|ev| {
+                if ev.slot <= ready_threshold {
+                    process_publish_event(ev, &data_rx, &mut pipeline_acc, &mut rng);
+                    false // processed -> drop from the buffer
+                } else {
+                    true // not yet ripe -> keep
+                }
+            });
         }
 
         if last_sweep.elapsed() >= sweep_interval {
@@ -374,21 +423,28 @@ pub fn run(
         }
 
         if last_flush.elapsed() >= cfg.flush_interval {
-            emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, &ts_missing, influx.as_ref());
+            // emit_pipeline first: it PEEKS the observation dropped/ts_missing
+            // counters (to surface drop-induced misclassification), then emit() resets
+            // them for the -health series.
             if pipeline_on {
-                emit_pipeline(&pipeline_acc, &pipeline_dropped, influx.as_ref());
+                emit_pipeline(&pipeline_acc, &pipeline_dropped, &dropped, &ts_missing, influx.as_ref());
                 pipeline_acc = PipelineAcc::default();
             }
+            emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, &ts_missing, influx.as_ref());
             acc.clear();
             last_flush = Instant::now();
         }
     }
 
     sweep_finalize(&mut map, current_max_slot, 0, leader.as_ref(), &mut acc);
-    emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, &ts_missing, influx.as_ref());
     if pipeline_on {
-        emit_pipeline(&pipeline_acc, &pipeline_dropped, influx.as_ref());
+        // Flush any still-deferred publish events (ignore the ripeness threshold).
+        for ev in pending_publish.drain(..) {
+            process_publish_event(&ev, &data_rx, &mut pipeline_acc, &mut rng);
+        }
+        emit_pipeline(&pipeline_acc, &pipeline_dropped, &dropped, &ts_missing, influx.as_ref());
     }
+    emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, &ts_missing, influx.as_ref());
     if let Some(w) = csv.as_mut() {
         let _ = w.flush();
     }
@@ -809,86 +865,87 @@ fn append_vs_jito(
 }
 
 /// Emit the pipeline-latency series (`shredstream_bench-pipeline`). Runs on the
-/// aggregator thread at flush; never touches the reconstruct hot path.
-fn emit_pipeline(acc: &PipelineAcc, pipeline_dropped: &AtomicU64, influx: Option<&InfluxWriter>) {
-    let dropped_now = pipeline_dropped.swap(0, Ordering::Relaxed);
+/// aggregator thread at flush; never touches the reconstruct hot path. `obs_dropped`
+/// and `ts_missing` are PEEKED (loaded, not reset) so the meta row surfaces the
+/// observation loss that can misclassify clean batches as incomplete; the -health
+/// series (emit(), called after this) resets them.
+fn emit_pipeline(
+    acc: &PipelineAcc,
+    pipeline_dropped: &AtomicU64,
+    obs_dropped: &AtomicU64,
+    ts_missing: &AtomicU64,
+    influx: Option<&InfluxWriter>,
+) {
+    let pipeline_dropped_now = pipeline_dropped.swap(0, Ordering::Relaxed);
+    let obs_dropped_now = obs_dropped.load(Ordering::Relaxed);
+    let ts_missing_now = ts_missing.load(Ordering::Relaxed);
     let Some(w) = influx else {
-        // No influx sink: surface the headline in the log so the data isn't lost.
-        if acc.clean_n + acc.recovered_n > 0 {
-            let mut d = acc.clean_debt_ns.clone();
-            let q = quantiles(&mut d, &[0.5, 0.99]);
+        if acc.clean_debt.n + acc.incomplete_debt.n + acc.no_anchor_n > 0 {
+            let q = acc.clean_debt.quantiles_us();
             info!(
-                "pipeline latency (clean n={}, recovered n={}): debt p50={}us p99={}us | anomalies={} dropped={}",
-                acc.clean_n,
-                acc.recovered_n,
-                q[0] / 1000,
-                q[1] / 1000,
+                "pipeline latency: clean n={} p50={}us p99={}us max={}us | incomplete n={} \
+                 no_anchor={} anomalies={} obs_dropped={} ts_missing={} pub_dropped={}",
+                acc.clean_debt.n,
+                q[0],
+                q[2],
+                acc.clean_debt.max_ns / 1000,
+                acc.incomplete_debt.n,
+                acc.no_anchor_n,
                 acc.clock_anomalies,
-                dropped_now,
+                obs_dropped_now,
+                ts_missing_now,
+                pipeline_dropped_now,
             );
         }
         return;
     };
     let ts = now_unix_nanos();
     let mut buf = String::new();
-    append_pipeline(
+    append_lat_series(&mut buf, ts, "clean", &acc.clean_debt, Some(&acc.clean_spread));
+    append_lat_series(&mut buf, ts, "incomplete", &acc.incomplete_debt, None);
+    // Per-window counters that are NOT per-class (so they aren't mis-attributed to
+    // one class). obs_dropped/ts_missing let a query discount the clean/incomplete
+    // split during observation-loss windows.
+    append_point(
         &mut buf,
+        "shredstream_bench-pipeline",
+        &[("leader", "ALL"), ("class", "meta")],
+        &[
+            ("no_anchor_n", acc.no_anchor_n as i64),
+            ("clock_anomalies", acc.clock_anomalies as i64),
+            ("unknown_start_excluded", acc.unknown_start_excluded as i64),
+            ("pipeline_dropped", pipeline_dropped_now as i64),
+            ("obs_dropped", obs_dropped_now as i64),
+            ("ts_missing", ts_missing_now as i64),
+        ],
         ts,
-        "clean",
-        &acc.clean_debt_ns,
-        Some(&acc.clean_spread_ns),
-        acc.clean_n,
-        acc.clock_anomalies,
-        dropped_now,
-        acc.unknown_start_excluded,
-    );
-    append_pipeline(
-        &mut buf,
-        ts,
-        "recovered",
-        &acc.recovered_debt_ns,
-        None,
-        acc.recovered_n,
-        0,
-        0,
-        0,
     );
     w.write(&buf);
 }
 
-/// `debt` = `T_publish - T_ready`; `spread` = `T_ready - T_first` (clean only).
-/// Both are non-negative; percentiles in microseconds.
-#[allow(clippy::too_many_arguments)]
-fn append_pipeline(
+/// Append one class row: `n` (exact count) + debt p50/p90/p99/max, and optional
+/// spread p50/p90/p99/max. Percentiles come from the reservoir; `n`/`max` are exact.
+fn append_lat_series(
     buf: &mut String,
     ts: u128,
     class: &str,
-    debt_ns: &[i64],
-    spread_ns: Option<&[i64]>,
-    n: u64,
-    clock_anomalies: u64,
-    dropped: u64,
-    unknown_start_excluded: u64,
+    debt: &LatSeries,
+    spread: Option<&LatSeries>,
 ) {
-    let mut d = debt_ns.to_vec();
-    let dq = quantiles(&mut d, &[0.5, 0.9, 0.99]);
-    let dmax = d.iter().copied().max().unwrap_or(0);
+    let dq = debt.quantiles_us();
     let mut fields: Vec<(&str, i64)> = vec![
-        ("n", n as i64),
-        ("debt_p50_us", dq[0] / 1000),
-        ("debt_p90_us", dq[1] / 1000),
-        ("debt_p99_us", dq[2] / 1000),
-        ("debt_max_us", dmax / 1000),
-        ("clock_anomalies", clock_anomalies as i64),
-        ("dropped", dropped as i64),
-        ("unknown_start_excluded", unknown_start_excluded as i64),
+        ("n", debt.n as i64),
+        ("debt_p50_us", dq[0]),
+        ("debt_p90_us", dq[1]),
+        ("debt_p99_us", dq[2]),
+        ("debt_max_us", debt.max_ns / 1000),
     ];
-    if let Some(s) = spread_ns {
-        let mut sv = s.to_vec();
-        let sq = quantiles(&mut sv, &[0.5, 0.9, 0.99]);
-        fields.push(("spread_p50_us", sq[0] / 1000));
-        fields.push(("spread_p90_us", sq[1] / 1000));
-        fields.push(("spread_p99_us", sq[2] / 1000));
+    if let Some(sp) = spread {
+        let sq = sp.quantiles_us();
+        fields.push(("spread_p50_us", sq[0]));
+        fields.push(("spread_p90_us", sq[1]));
+        fields.push(("spread_p99_us", sq[2]));
+        fields.push(("spread_max_us", sp.max_ns / 1000));
     }
     append_point(
         buf,
@@ -1068,26 +1125,29 @@ mod tests {
         m.insert((100, 1), 1500); // latest -> T_ready
         m.insert((100, 2), 1200);
         let mut acc = PipelineAcc::default();
-        process_publish_event(&ev(100, 0, 2, false, 1800), &m, &mut acc);
-        assert_eq!(acc.clean_n, 1);
-        assert_eq!(acc.recovered_n, 0);
-        assert_eq!(acc.clean_debt_ns, vec![1800 - 1500]); // publish - T_ready = 300
-        assert_eq!(acc.clean_spread_ns, vec![1500 - 1000]); // T_ready - T_first = 500
+        let mut rng = rand::thread_rng();
+        process_publish_event(&ev(100, 0, 2, false, 1800), &m, &mut acc, &mut rng);
+        assert_eq!(acc.clean_debt.n, 1);
+        assert_eq!(acc.incomplete_debt.n, 0);
+        assert_eq!(acc.clean_debt.samples, vec![300]); // publish - T_ready
+        assert_eq!(acc.clean_debt.max_ns, 300);
+        assert_eq!(acc.clean_spread.samples, vec![500]); // T_ready - T_first
     }
 
     #[test]
-    fn pipeline_recovered_sample() {
-        // Index 1 was FEC-recovered (no observation) -> recovered class, approx debt
-        // anchored on the max observed arrival.
+    fn pipeline_incomplete_sample() {
+        // Index 1 absent (FEC-recovered or observation lost) -> incomplete class,
+        // approx debt anchored on the max observed arrival.
         let mut m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
         m.insert((100, 0), 1000);
         m.insert((100, 2), 1200);
         let mut acc = PipelineAcc::default();
-        process_publish_event(&ev(100, 0, 2, false, 1600), &m, &mut acc);
-        assert_eq!(acc.clean_n, 0);
-        assert_eq!(acc.recovered_n, 1);
-        assert_eq!(acc.recovered_debt_ns, vec![1600 - 1200]); // 400
-        assert!(acc.clean_spread_ns.is_empty()); // spread not defined for recovered
+        let mut rng = rand::thread_rng();
+        process_publish_event(&ev(100, 0, 2, false, 1600), &m, &mut acc, &mut rng);
+        assert_eq!(acc.clean_debt.n, 0);
+        assert_eq!(acc.incomplete_debt.n, 1);
+        assert_eq!(acc.incomplete_debt.samples, vec![400]);
+        assert!(acc.clean_spread.samples.is_empty()); // spread only for clean
     }
 
     #[test]
@@ -1095,38 +1155,58 @@ mod tests {
         let mut m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
         m.insert((100, 0), 2000);
         let mut acc = PipelineAcc::default();
+        let mut rng = rand::thread_rng();
         // negative debt (publish before ready)
-        process_publish_event(&ev(100, 0, 0, false, 1000), &m, &mut acc);
+        process_publish_event(&ev(100, 0, 0, false, 1000), &m, &mut acc, &mut rng);
         // absurd debt (> CAP)
         process_publish_event(
             &ev(100, 0, 0, false, 2000 + PIPELINE_MAX_PLAUSIBLE_NS + 1),
             &m,
             &mut acc,
+            &mut rng,
         );
         assert_eq!(acc.clock_anomalies, 2);
-        assert_eq!(acc.clean_n, 0);
-        assert_eq!(acc.recovered_n, 0);
+        assert_eq!(acc.clean_debt.n, 0);
+        assert_eq!(acc.incomplete_debt.n, 0);
+    }
+
+    #[test]
+    fn pipeline_spread_clock_guard() {
+        // A huge intra-batch spread (a CLOCK_REALTIME step landing between arrivals)
+        // is rejected even though debt is in range — spread must not poison the
+        // percentiles unguarded.
+        let mut m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
+        m.insert((100, 0), 1000);
+        let max_rx = 1000 + PIPELINE_MAX_PLAUSIBLE_NS + 1000;
+        m.insert((100, 1), max_rx);
+        let mut acc = PipelineAcc::default();
+        let mut rng = rand::thread_rng();
+        process_publish_event(&ev(100, 0, 1, false, max_rx + 100), &m, &mut acc, &mut rng);
+        assert_eq!(acc.clock_anomalies, 1);
+        assert_eq!(acc.clean_debt.n, 0);
+        assert_eq!(acc.clean_spread.n, 0);
     }
 
     #[test]
     fn pipeline_unknown_start_excluded() {
         let m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
         let mut acc = PipelineAcc::default();
-        process_publish_event(&ev(100, 0, 2, true, 5000), &m, &mut acc);
+        let mut rng = rand::thread_rng();
+        process_publish_event(&ev(100, 0, 2, true, 5000), &m, &mut acc, &mut rng);
         assert_eq!(acc.unknown_start_excluded, 1);
-        assert_eq!(acc.clean_n, 0);
-        assert_eq!(acc.recovered_n, 0);
+        assert_eq!(acc.clean_debt.n, 0);
+        assert_eq!(acc.incomplete_debt.n, 0);
     }
 
     #[test]
-    fn pipeline_fully_recovered_counts_no_sample() {
-        // No composing index observed (fully recovered / evicted): count it, but we
-        // have no arrival anchor to measure against, so no debt sample.
+    fn pipeline_no_anchor_counts_no_sample() {
+        // No composing index observed: count it, but no arrival anchor -> no sample.
         let m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
         let mut acc = PipelineAcc::default();
-        process_publish_event(&ev(100, 5, 6, false, 9999), &m, &mut acc);
-        assert_eq!(acc.recovered_n, 1);
-        assert!(acc.recovered_debt_ns.is_empty());
-        assert_eq!(acc.clean_n, 0);
+        let mut rng = rand::thread_rng();
+        process_publish_event(&ev(100, 5, 6, false, 9999), &m, &mut acc, &mut rng);
+        assert_eq!(acc.no_anchor_n, 1);
+        assert!(acc.incomplete_debt.samples.is_empty());
+        assert_eq!(acc.clean_debt.n, 0);
     }
 }

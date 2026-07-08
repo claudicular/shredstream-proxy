@@ -326,6 +326,9 @@ pub struct BenchmarkRuntime {
 /// leader-schedule poller (if an RPC URL is set) and the aggregator thread.
 pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<BenchmarkRuntime> {
     if !config.enabled {
+        if config.pipeline_latency {
+            warn!("--enable-pipeline-latency ignored: it requires --enable-benchmark");
+        }
         return None;
     }
     info!("benchmark enabled: {config:?}");

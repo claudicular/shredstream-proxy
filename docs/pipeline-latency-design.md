@@ -70,21 +70,29 @@ Per published `Vec<Entry>` B, two primary series (both derived, same clock):
   "shreds arrived spread out / straggler source" (high spread).
 
 Aggregation:
-- **Percentiles** p50/p90/p99/max (reuse `benchmark/stats.rs::quantiles`); never
-  means. MEV value is in the tail.
-- **Segment** by `class` ∈ {`clean`, `recovered`} (§5), reported globally
+- **Percentiles** p50/p90/p99 from a **reservoir sample** (uniform over the whole
+  window, so late-window tail spikes still land in the percentiles), plus an
+  **exact running `max` and `n`** independent of the sample cap. Never means. MEV
+  value is in the tail.
+- **Segment** by `class` ∈ {`clean`, `incomplete`} (§5), reported globally
   (`leader="ALL"`) for the first cut. Per-leader and multi-FEC splits are
   deferred (§7): pipeline debt is *box-load*-driven, not leader-driven, so the
   global distribution captures the primary signal; per-leader `spread` is a later
   refinement.
 - **Windowed** flush (reuse `--benchmark-flush-secs`).
-- **Clock guard:** clamp samples that are negative or `> CAP` (~200ms, well under
-  slot time) into a `clock_anomaly` counter — never into percentiles. Run chrony
-  slew-only on the prod box. (`CLOCK_REALTIME` can step under NTP.)
+- **Clock guard:** reject `debt` **and** `spread` samples that are negative or
+  `> CAP` (~200ms, well under slot time) into a `clock_anomalies` counter — never
+  into percentiles. Run chrony slew-only on the prod box. (`CLOCK_REALTIME` can
+  step under NTP.)
 
-InfluxDB measurement: `shredstream_bench-pipeline` (tags: `leader="ALL"`,
-`class` ∈ {clean, recovered}; fields: `n`, `debt_p50/p90/p99/max_us`,
-`spread_p50/p90/p99_us`, `clock_anomalies`, `dropped`).
+InfluxDB measurement: `shredstream_bench-pipeline`, tag `leader="ALL"`, three rows
+per flush by `class`:
+- `class=clean` — `n`, `debt_p50/p90/p99/max_us`, `spread_p50/p90/p99/max_us`
+- `class=incomplete` — `n`, `debt_p50/p90/p99/max_us` (no spread)
+- `class=meta` — `no_anchor_n`, `clock_anomalies`, `unknown_start_excluded`,
+  `pipeline_dropped`, `obs_dropped`, `ts_missing` (per-window counters that are not
+  per-class; `obs_dropped`/`ts_missing` let a query discount the clean/incomplete
+  split during observation-loss windows).
 
 ## 4. Architecture — Design B (aggregator-join)
 
@@ -122,26 +130,38 @@ Aggregator additions (all off the hot path):
 - A windowed secondary map `(slot, data_index) → earliest_rx`, populated from the
   Observation stream (data index is unique per slot, so `fec_set_index` is not
   needed in the key). Evict with the same slot-age window as the match map.
-- A `PublishEvent` intake (new bounded drop-on-full channel, or a new variant on
-  the existing observation channel) + the join + the two-series accumulators +
-  emit. Reuse `influx.rs` `append_point` / `InfluxWriter`.
+- A `PublishEvent` intake (bounded drop-on-full channel) + the join + the
+  accumulators + emit. Reuse `influx.rs` `append_point` / `InfluxWriter`.
+- **Deferral (`PUBLISH_DEFER_SLOTS = 3`):** publish events are buffered and joined
+  only once their slot is a few slots behind the frontier (`current_max_slot`). By
+  then every composing shred's observation has been ingested, so an index absent
+  from the arrival map reliably means "unobserved" rather than "the observation
+  drain hasn't caught up / the aggregator was mid-InfluxDB-POST". This removes the
+  drain-order race between the two channels (a shred is always *observed* before it
+  is *published*, since it is tapped at arrival and reconstructed later).
 
-## 5. FEC-recovered shreds (coarse handling)
+## 5. Unobserved composing shreds — the `incomplete` class
 
 Recovery fills a data index from coding shreds; that index never arrived as a data
-shred, so it has no `rx`. Because the tap observes **all** sources pre-dedup,
-"no observation for `(slot, i, data)`" ⟺ "no source delivered it" ⟺ "recovered"
-(modulo a rare late-arrival case, acceptable for the coarse cut).
+shred, so it has no `rx`. Because the tap observes **all** sources pre-dedup, an
+index absent from the arrival map is *usually* FEC-recovered. But an index can also
+be absent because its observation was **dropped** (bounded observation channel full
+under load) or its **kernel timestamp was missing** (`ts=0` sentinel, skipped). All
+three are load-correlated, so the class is honestly named **`incomplete`** (≥1
+composing index unobserved) rather than claiming pure FEC recovery.
 
-Coarse rule: if **any** composing index in `[s..=e]` is missing from the
-observation map → tag the batch `class=recovered` and route it to the separate
-`recovered` series (compute `debt`/`spread` over the found indices, flagged
-approximate). All-direct batches are the clean primary series.
+Rule: if **any** composing index in `[s..=e]` is missing from the arrival map → tag
+`class=incomplete` and measure `debt` over the found indices (approximate — it can
+over-estimate `debt`). If **no** composing index was observed at all → count it as
+`no_anchor_n` (no arrival anchor, no sample). All-observed batches are `clean`.
 
-The precise version — track the per-FEC-set coding-shred arrival that crossed the
-recovery threshold (`recover_time(f) = a_f[k_f]`) so recovered batches get an exact
-`T_ready` — needs reconstruct's ground truth (which shreds it recovered, the FEC
-threshold `k`). That is a later upgrade and pushes toward Design A. Deferred.
+The drain-order source of false-incompletes is removed by the deferral (§4); the
+genuine observation-drop / cmsg-missing sources cannot be distinguished from real
+FEC recovery in Design B, so instead the `class=meta` row surfaces `obs_dropped`
+and `ts_missing` per window — a query can discount the clean/incomplete split during
+loss windows. The precise version (track the per-FEC-set coding-shred arrival that
+crossed the recovery threshold, `recover_time(f) = a_f[k_f]`) needs reconstruct's
+ground truth and pushes toward Design A. Deferred.
 
 ## 6. Hot-path guarantees & gating
 
