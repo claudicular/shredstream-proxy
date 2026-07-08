@@ -119,6 +119,13 @@ pub struct BenchmarkArgs {
     /// vs-jito headline series + health).
     #[arg(long, env, default_value_t = false)]
     pub benchmark_emit_source_pair: bool,
+
+    /// Enable proxy-internal pipeline-latency measurement (shred NIC arrival ->
+    /// shmem/gRPC publish), emitted as the `shredstream_bench-pipeline` series.
+    /// Requires `--benchmark-kernel-timestamps` (per-shred kernel arrival ts);
+    /// ignored with a warning otherwise. See docs/pipeline-latency-design.md.
+    #[arg(long, env, default_value_t = false)]
+    pub enable_pipeline_latency: bool,
 }
 
 impl BenchmarkArgs {
@@ -144,6 +151,7 @@ impl BenchmarkArgs {
                 token: self.benchmark_influx_token.clone().unwrap_or_default(),
             }),
             emit_source_pair: self.benchmark_emit_source_pair,
+            pipeline_latency: self.enable_pipeline_latency,
         }
     }
 }
@@ -165,6 +173,7 @@ pub struct BenchmarkConfig {
     pub aggregator_core_id: Option<usize>,
     pub influx: Option<influx::InfluxConfig>,
     pub emit_source_pair: bool,
+    pub pipeline_latency: bool,
 }
 
 /// Cheap, cloneable handle the ingest path uses to push observations. The only
@@ -174,6 +183,10 @@ pub struct BenchmarkConfig {
 pub struct BenchmarkHandle {
     sender: Sender<Vec<Observation>>,
     dropped: Arc<AtomicU64>,
+    /// Packets whose kernel timestamp was unavailable (cmsg missing, ts <= 0) and
+    /// were therefore skipped rather than folded into the latency series with a
+    /// fake dequeue time. Surfaced in the `-health` series.
+    ts_missing: Arc<AtomicU64>,
 }
 
 impl BenchmarkHandle {
@@ -193,6 +206,13 @@ impl BenchmarkHandle {
         rx_ts_ns: i64,
         source_override: Option<IpAddr>,
     ) {
+        // Skip a batch with no valid receive timestamp rather than recording a
+        // bogus (~0-latency) sample; count it so the loss is visible.
+        if rx_ts_ns <= 0 {
+            self.ts_missing
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            return;
+        }
         let mut obs = Vec::with_capacity(batch.len());
         for pkt in batch.iter() {
             if let Some(data) = pkt.data(..) {
@@ -221,6 +241,12 @@ impl BenchmarkHandle {
     ) {
         let mut obs = Vec::with_capacity(packets.len());
         for (pkt, &t) in packets.iter().zip(ts.iter()) {
+            // ts <= 0 is the "no kernel timestamp" sentinel (cmsg missing); skip
+            // and count rather than folding a fake arrival time into the series.
+            if t <= 0 {
+                self.ts_missing.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             if let Some(data) = pkt.data(..) {
                 let src = source_override.unwrap_or_else(|| pkt.meta().addr);
                 if let Some(o) = parse::parse_observation(data, src, t) {
@@ -241,6 +267,25 @@ impl BenchmarkHandle {
             // Count dropped observations (not batches) so the metric reflects
             // true sample loss under overload.
             self.dropped.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Cheap handle the reconstruct thread uses to report a published `Vec<Entry>` to
+/// the pipeline-latency aggregator. `record` is the only new hot-path work: the
+/// caller takes one `now()` and calls this, which does a single non-blocking
+/// `try_send` (drop-on-full). It can never block or backpressure reconstruct.
+#[derive(Clone)]
+pub struct PipelineLatencyHandle {
+    sender: Sender<aggregator::PublishEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl PipelineLatencyHandle {
+    #[inline]
+    pub fn record(&self, ev: aggregator::PublishEvent) {
+        if self.sender.try_send(ev).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -271,6 +316,9 @@ fn pin_to_core(_core_id: usize) {}
 pub struct BenchmarkRuntime {
     pub handle: BenchmarkHandle,
     pub kernel_timestamps: bool,
+    /// Present only when `--enable-pipeline-latency` is on (and kernel timestamps
+    /// are enabled). The forwarder hands this to the reconstruct thread.
+    pub pipeline_handle: Option<PipelineLatencyHandle>,
     pub join_handles: Vec<JoinHandle<()>>,
 }
 
@@ -292,6 +340,33 @@ pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<Benchmark
 
     let (sender, receiver) = crossbeam_channel::bounded::<Vec<Observation>>(config.channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
+    let ts_missing = Arc::new(AtomicU64::new(0));
+
+    // Pipeline-latency path (optional). Requires kernel timestamps: it measures
+    // shred arrival -> shmem/gRPC publish, and a meaningful arrival clock needs the
+    // per-shred kernel SO_TIMESTAMPNS timestamp, not a userspace batch dequeue time.
+    let pipeline_on = config.pipeline_latency && config.kernel_timestamps;
+    if config.pipeline_latency && !config.kernel_timestamps {
+        warn!(
+            "--enable-pipeline-latency ignored: it requires --benchmark-kernel-timestamps \
+             (per-shred kernel arrival timestamp)"
+        );
+    }
+    let pipeline_dropped = Arc::new(AtomicU64::new(0));
+    let (pipeline_handle, pipeline_rx) = if pipeline_on {
+        info!("benchmark pipeline-latency measurement ON (shredstream_bench-pipeline series)");
+        let (ptx, prx) =
+            crossbeam_channel::bounded::<aggregator::PublishEvent>(config.channel_capacity);
+        (
+            Some(PipelineLatencyHandle {
+                sender: ptx,
+                dropped: pipeline_dropped.clone(),
+            }),
+            Some(prx),
+        )
+    } else {
+        (None, None)
+    };
 
     // Validator map (optional).
     let validators: Option<Arc<ValidatorMap>> = match &config.validator_map_path {
@@ -326,6 +401,8 @@ pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<Benchmark
     // Aggregator thread.
     let agg_cfg = config.clone();
     let agg_dropped = dropped.clone();
+    let agg_ts_missing = ts_missing.clone();
+    let agg_pipeline_dropped = pipeline_dropped.clone();
     let agg_exit = exit.clone();
     let agg_validators = validators.clone();
     let agg_core = config.aggregator_core_id;
@@ -341,6 +418,9 @@ pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<Benchmark
                 leader_handle,
                 agg_validators,
                 agg_dropped,
+                agg_ts_missing,
+                pipeline_rx,
+                agg_pipeline_dropped,
                 agg_exit,
             );
         })
@@ -348,8 +428,13 @@ pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<Benchmark
     join_handles.push(agg_join);
 
     Some(BenchmarkRuntime {
-        handle: BenchmarkHandle { sender, dropped },
+        handle: BenchmarkHandle {
+            sender,
+            dropped,
+            ts_missing,
+        },
         kernel_timestamps: config.kernel_timestamps,
+        pipeline_handle,
         join_handles,
     })
 }

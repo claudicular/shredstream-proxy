@@ -43,6 +43,7 @@ use {
 use super::BenchmarkHandle;
 
 #[inline]
+#[allow(dead_code)] // used only on the non-Linux recv path
 fn now_unix_nanos() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -206,7 +207,6 @@ pub fn recv_mmsg_timestamped(
         usize::try_from(nrecv).unwrap()
     };
 
-    let fallback = now_unix_nanos();
     for i in 0..nrecv {
         let hdr = unsafe { hdrs[i].assume_init_ref() };
         let addr = unsafe { addrs[i].assume_init_ref() };
@@ -214,7 +214,11 @@ pub fn recv_mmsg_timestamped(
         if let Some(addr) = cast_socket_addr(addr, hdr) {
             packets[i].meta_mut().set_socket_addr(&addr);
         }
-        out_ts[i] = extract_timestamp(&hdr.msg_hdr).unwrap_or(fallback);
+        // 0 is a sentinel meaning "no kernel timestamp available" (cmsg missing).
+        // Downstream observers SKIP ts <= 0 rather than substituting now(): folding
+        // a userspace dequeue time in as if it were an arrival timestamp would record
+        // ~0 latency and bias the benchmark/pipeline distributions down under load.
+        out_ts[i] = extract_timestamp(&hdr.msg_hdr).unwrap_or(0);
     }
 
     for i in 0..count {

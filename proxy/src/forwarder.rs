@@ -61,6 +61,7 @@ pub fn start_forwarder_threads(
     shmem_ring_path: Option<std::path::PathBuf>,
     bench_handle: Option<crate::benchmark::BenchmarkHandle>,
     bench_kernel_timestamps: bool,
+    pipeline_handle: Option<crate::benchmark::PipelineLatencyHandle>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
@@ -111,6 +112,9 @@ pub fn start_forwarder_threads(
                 >::default();
                 let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
                 let mut deshredded_entries = Vec::<(Slot, Vec<u8>)>::new();
+                // Parallel to deshredded_entries: composing data-shred index range +
+                // unknown_start, for pipeline-latency attribution.
+                let mut entry_ranges = Vec::<(u32, u32, bool)>::new();
                 let mut highest_slot_seen: Slot = 0;
                 let rs_cache = ReedSolomonCache::default();
 
@@ -122,25 +126,45 @@ pub fn start_forwarder_threads(
                                 &mut all_shreds,
                                 &mut slot_fec_indexes_to_iterate,
                                 &mut deshredded_entries,
+                                &mut entry_ranges,
                                 &mut highest_slot_seen,
                                 &rs_cache,
                                 &metrics,
                             );
 
-                            deshredded_entries.drain(..).for_each(
-                                |(slot, entries_bytes)| {
-                                    // Shmem write FIRST (lowest latency path)
-                                    if let Some(ref mut ring) = shmem_ring {
-                                        ring.publish(slot, &entries_bytes);
-                                    }
+                            for ((slot, entries_bytes), (start_index, end_index, unknown_start)) in
+                                deshredded_entries.drain(..).zip(entry_ranges.drain(..))
+                            {
+                                // Shmem write FIRST (lowest latency path) — unchanged.
+                                if let Some(ref mut ring) = shmem_ring {
+                                    ring.publish(slot, &entries_bytes);
+                                }
 
-                                    // Then gRPC broadcast (existing path)
-                                    let _ = entry_sender.send(PbEntry {
+                                // Pipeline latency: AFTER the shmem write (so it never
+                                // delays consumer visibility), capture the realtime
+                                // publish instant and hand a tiny event to the
+                                // aggregator. Non-blocking (drop-on-full); a single
+                                // Option branch when disabled.
+                                if let Some(ph) = pipeline_handle.as_ref() {
+                                    let publish_ts_ns = SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_nanos() as i64)
+                                        .unwrap_or(0);
+                                    ph.record(crate::benchmark::aggregator::PublishEvent {
                                         slot,
-                                        entries: entries_bytes,
+                                        start_index,
+                                        end_index,
+                                        unknown_start,
+                                        publish_ts_ns,
                                     });
-                                },
-                            );
+                                }
+
+                                // Then gRPC broadcast (existing path).
+                                let _ = entry_sender.send(PbEntry {
+                                    slot,
+                                    entries: entries_bytes,
+                                });
+                            }
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {} // do nothing
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,

@@ -56,6 +56,7 @@ impl Default for ShredsStateTracker {
 /// receive shreds per FEC set, attempting to recover the other shreds in the fec set so you do not have to wait until all data shreds have arrived.
 /// every time a fec is recovered, scan for neighbouring DATA_COMPLETE_SHRED flags in the shreds, attempting to deserialize into solana entries when there are no missing shreds between the DATA_COMPLETE_SHRED flags.
 /// note that an FEC set doesn't necessarily contain DATA_COMPLETE_SHRED in the last shred. when deserializing the bincode data, you must use data between shreds starting at the last DATA_COMPLETE_SHRED (not inclusive) to the next DATA_COMPLETE_SHRED (inclusive)
+#[allow(clippy::too_many_arguments)]
 pub fn reconstruct_shreds(
     packet_batch: PacketBatch,
     all_shreds: &mut ahash::HashMap<
@@ -67,11 +68,17 @@ pub fn reconstruct_shreds(
     >,
     slot_fec_indexes_to_iterate: &mut Vec<(Slot, u32)>,
     deshredded_entries: &mut Vec<(Slot, Vec<u8>)>,
+    // Parallel to `deshredded_entries` (same order/length): the inclusive composing
+    // data-shred index range `(start, end)` and whether the left boundary was guessed
+    // (`unknown_start`), for pipeline-latency attribution. Filled unconditionally
+    // (negligible); the reconstruct thread ignores it when pipeline latency is off.
+    entry_ranges: &mut Vec<(u32, u32, bool)>,
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
 ) -> usize {
     deshredded_entries.clear();
+    entry_ranges.clear();
     slot_fec_indexes_to_iterate.clear();
     // ingest all packets
     for packet in packet_batch.iter().filter_map(|p| p.data(..)) {
@@ -223,6 +230,11 @@ pub fn reconstruct_shreds(
         }
 
         deshredded_entries.push((*slot, deshredded_payload));
+        entry_ranges.push((
+            start_data_complete_idx as u32,
+            end_data_complete_idx as u32,
+            unknown_start,
+        ));
         to_deshred.iter().for_each(|shred| {
             let Some(shred) = shred.as_ref() else {
                 return;
@@ -669,6 +681,7 @@ mod tests {
             &mut all_shreds,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
+            &mut Vec::new(),
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
@@ -730,6 +743,7 @@ mod tests {
             &mut all_shreds,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
+            &mut Vec::new(),
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
@@ -857,6 +871,7 @@ mod tests {
             &mut all_shreds,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
+            &mut Vec::new(),
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
@@ -918,6 +933,7 @@ mod tests {
             &mut all_shreds,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
+            &mut Vec::new(),
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
@@ -1010,6 +1026,7 @@ mod tests {
             &mut all_shreds,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
+            &mut Vec::new(),
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
@@ -1048,6 +1065,7 @@ mod tests {
             &mut all_shreds,
             &mut slot_fec_indexes_to_iterate,
             &mut deshredded_entries,
+            &mut Vec::new(),
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,

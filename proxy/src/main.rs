@@ -318,6 +318,9 @@ fn main() -> Result<(), ShredstreamProxyError> {
         .as_ref()
         .map(|rt| rt.kernel_timestamps)
         .unwrap_or(false);
+    let bench_pipeline_handle = benchmark_runtime
+        .as_ref()
+        .and_then(|rt| rt.pipeline_handle.clone());
 
     let forwarder_hdls = forwarder::start_forwarder_threads(
         unioned_dest_sockets.clone(),
@@ -335,6 +338,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         args.shmem_ring_path.clone(),
         bench_handle,
         bench_kernel_timestamps,
+        bench_pipeline_handle,
         shutdown_receiver.clone(),
         exit.clone(),
     );

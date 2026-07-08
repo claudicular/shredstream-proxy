@@ -61,6 +61,110 @@ const MAX_SAMPLES_PER_SERIES: usize = 16_384;
 /// Max batches drained per outer-loop iteration before yielding to sweep/flush,
 /// so sustained load can't starve eviction (which would grow the map unbounded).
 const DRAIN_CAP: usize = 4_096;
+/// Reject pipeline-latency samples outside `[0, this]` as clock anomalies (an NTP
+/// step / CLOCK_REALTIME jump) instead of poisoning the percentiles. Well above any
+/// real reconstruct latency, well under a slot (400ms).
+const PIPELINE_MAX_PLAUSIBLE_NS: i64 = 200_000_000; // 200ms
+
+/// Reported by the reconstruct thread each time it publishes one `Vec<Entry>`. The
+/// aggregator joins it against observed per-shred arrival timestamps
+/// (`(slot, data_index) -> earliest rx`) to derive pipeline latency, so the
+/// reconstruct thread itself computes nothing. Tiny and `Copy` (drop-on-full).
+#[derive(Clone, Copy, Debug)]
+pub struct PublishEvent {
+    pub slot: Slot,
+    /// Inclusive composing data-shred index range `[start_index, end_index]`.
+    pub start_index: u32,
+    pub end_index: u32,
+    /// The left DATA_COMPLETE boundary was missing and `get_indexes` guessed the
+    /// range; such batches are excluded from the clean distribution.
+    pub unknown_start: bool,
+    /// CLOCK_REALTIME nanos captured right after the shmem publish.
+    pub publish_ts_ns: i64,
+}
+
+/// Per-flush pipeline-latency accumulators (`debt = T_publish - T_ready`,
+/// `spread = T_ready - T_first`), split into `clean` (every composing shred was
+/// observed) and `recovered` (>=1 composing shred was FEC-recovered / unobserved).
+#[derive(Default)]
+struct PipelineAcc {
+    clean_n: u64,
+    clean_debt_ns: Vec<i64>,
+    clean_spread_ns: Vec<i64>,
+    recovered_n: u64,
+    recovered_debt_ns: Vec<i64>,
+    clock_anomalies: u64,
+    unknown_start_excluded: u64,
+}
+
+impl PipelineAcc {
+    fn push_clean(&mut self, debt_ns: i64, spread_ns: i64) {
+        self.clean_n += 1;
+        if self.clean_debt_ns.len() < MAX_SAMPLES_PER_SERIES {
+            self.clean_debt_ns.push(debt_ns);
+        }
+        if self.clean_spread_ns.len() < MAX_SAMPLES_PER_SERIES {
+            self.clean_spread_ns.push(spread_ns);
+        }
+    }
+    fn push_recovered(&mut self, debt_ns: i64) {
+        self.recovered_n += 1;
+        if self.recovered_debt_ns.len() < MAX_SAMPLES_PER_SERIES {
+            self.recovered_debt_ns.push(debt_ns);
+        }
+    }
+}
+
+/// Join one publish event against the observed arrival map and fold the resulting
+/// latency into `acc`. `data_rx` = `(slot, data_index) -> earliest observed rx`.
+fn process_publish_event(
+    ev: &PublishEvent,
+    data_rx: &ahash::HashMap<(Slot, u32), i64>,
+    acc: &mut PipelineAcc,
+) {
+    // Guessed left boundary => composing set is uncertain; exclude.
+    if ev.unknown_start {
+        acc.unknown_start_excluded += 1;
+        return;
+    }
+    let mut min_rx = i64::MAX;
+    let mut max_rx = i64::MIN;
+    let mut missing = false; // >=1 composing index was never observed (recovered)
+    for idx in ev.start_index..=ev.end_index {
+        match data_rx.get(&(ev.slot, idx)) {
+            Some(&t) => {
+                if t < min_rx {
+                    min_rx = t;
+                }
+                if t > max_rx {
+                    max_rx = t;
+                }
+            }
+            None => missing = true,
+        }
+    }
+    if max_rx == i64::MIN {
+        // No composing index was observed (fully recovered, or evicted). Count it
+        // but we have no arrival anchor to measure against.
+        acc.recovered_n += 1;
+        return;
+    }
+    // T_ready = max availability over composing shreds; among observed shreds that
+    // is the max arrival. debt = publish - T_ready.
+    let debt = ev.publish_ts_ns - max_rx;
+    if !(0..=PIPELINE_MAX_PLAUSIBLE_NS).contains(&debt) {
+        acc.clock_anomalies += 1;
+        return;
+    }
+    if missing {
+        // Approximate: the true completion may be a coding-shred arrival we don't
+        // track here, so this under-estimates T_ready (over-estimates debt).
+        acc.push_recovered(debt);
+    } else {
+        let spread = max_rx - min_rx; // >= 0
+        acc.push_clean(debt, spread);
+    }
+}
 
 /// Earliest arrival timestamp per source for one shred.
 #[derive(Default)]
@@ -179,17 +283,28 @@ type LeaderKey = Option<Pubkey>;
 /// a separate `shred_type` series and never pollute the data headline.
 type AccKey = (LeaderKey, bool);
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     rx: Receiver<Vec<Observation>>,
     cfg: BenchmarkConfig,
     leader: Option<LeaderScheduleHandle>,
     validators: Option<Arc<ValidatorMap>>,
     dropped: Arc<AtomicU64>,
+    ts_missing: Arc<AtomicU64>,
+    pipeline_rx: Option<Receiver<PublishEvent>>,
+    pipeline_dropped: Arc<AtomicU64>,
     exit: Arc<AtomicBool>,
 ) {
     let mut map: ahash::HashMap<ShredId, PerSourceArrival> = ahash::HashMap::default();
     let mut acc: HashMap<AccKey, LeaderAgg> = HashMap::new();
     let mut current_max_slot: Slot = 0;
+
+    // Pipeline-latency (Design B): a windowed (slot, data_index) -> earliest rx map
+    // populated from the observation stream, joined against reconstruct's publish
+    // events. Empty/unused when pipeline latency is off.
+    let pipeline_on = pipeline_rx.is_some();
+    let mut data_rx: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
+    let mut pipeline_acc = PipelineAcc::default();
 
     let mut csv = open_csv(&cfg);
     let influx = cfg.influx.as_ref().and_then(InfluxWriter::new);
@@ -213,12 +328,12 @@ pub fn run(
         let leader_bounds = leader.as_ref().and_then(|h| h.bounds());
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(batch) => {
-                ingest(&mut map, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds);
+                ingest(&mut map, &mut data_rx, pipeline_on, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds);
                 let mut drained = 1;
                 while drained < DRAIN_CAP {
                     match rx.try_recv() {
                         Ok(batch) => {
-                            ingest(&mut map, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds);
+                            ingest(&mut map, &mut data_rx, pipeline_on, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds);
                             drained += 1;
                         }
                         Err(_) => break,
@@ -229,8 +344,29 @@ pub fn run(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
 
+        // Drain publish events and join them against the (already up-to-date)
+        // arrival map. A batch's shreds were observed at arrival, long before its
+        // publish event, so their `rx` is present in `data_rx` here.
+        if let Some(prx) = pipeline_rx.as_ref() {
+            let mut drained = 0;
+            while drained < DRAIN_CAP {
+                match prx.try_recv() {
+                    Ok(ev) => {
+                        process_publish_event(&ev, &data_rx, &mut pipeline_acc);
+                        drained += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
         if last_sweep.elapsed() >= sweep_interval {
             sweep_finalize(&mut map, current_max_slot, cfg.window_slots, leader.as_ref(), &mut acc);
+            if pipeline_on {
+                // Evict the arrival map on the same slot-age window as the match map.
+                let threshold = current_max_slot.saturating_sub(cfg.window_slots);
+                data_rx.retain(|(slot, _), _| *slot >= threshold);
+            }
             last_sweep = Instant::now();
             if let Some(w) = csv.as_mut() {
                 let _ = w.flush();
@@ -238,14 +374,21 @@ pub fn run(
         }
 
         if last_flush.elapsed() >= cfg.flush_interval {
-            emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, influx.as_ref());
+            emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, &ts_missing, influx.as_ref());
+            if pipeline_on {
+                emit_pipeline(&pipeline_acc, &pipeline_dropped, influx.as_ref());
+                pipeline_acc = PipelineAcc::default();
+            }
             acc.clear();
             last_flush = Instant::now();
         }
     }
 
     sweep_finalize(&mut map, current_max_slot, 0, leader.as_ref(), &mut acc);
-    emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, influx.as_ref());
+    emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, &ts_missing, influx.as_ref());
+    if pipeline_on {
+        emit_pipeline(&pipeline_acc, &pipeline_dropped, influx.as_ref());
+    }
     if let Some(w) = csv.as_mut() {
         let _ = w.flush();
     }
@@ -263,8 +406,11 @@ fn slot_is_plausible(slot: Slot, current_max: Slot, leader_bounds: Option<(Slot,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest(
     map: &mut ahash::HashMap<ShredId, PerSourceArrival>,
+    data_rx: &mut ahash::HashMap<(Slot, u32), i64>,
+    pipeline_on: bool,
     current_max_slot: &mut Slot,
     cfg: &BenchmarkConfig,
     csv: &mut Option<BufWriter<std::fs::File>>,
@@ -289,6 +435,19 @@ fn ingest(
         }
         if obs.slot > *current_max_slot {
             *current_max_slot = obs.slot;
+        }
+        // Pipeline latency: record the earliest arrival per data-shred index (min
+        // across sources = true earliest). `rx_ts_ns` is always > 0 here (the tap
+        // skips the no-kernel-timestamp sentinel).
+        if pipeline_on && obs.is_data {
+            data_rx
+                .entry((obs.slot, obs.index))
+                .and_modify(|t| {
+                    if obs.rx_ts_ns < *t {
+                        *t = obs.rx_ts_ns;
+                    }
+                })
+                .or_insert(obs.rx_ts_ns);
         }
         if cfg.data_only && !obs.is_data {
             continue;
@@ -410,17 +569,23 @@ fn finalize_one(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit(
     acc: &HashMap<AccKey, LeaderAgg>,
     validators: Option<&ValidatorMap>,
     leader: Option<&LeaderScheduleHandle>,
     cfg: &BenchmarkConfig,
     dropped: &AtomicU64,
+    ts_missing: &AtomicU64,
     influx: Option<&InfluxWriter>,
 ) {
     let dropped_now = dropped.swap(0, Ordering::Relaxed);
+    let ts_missing_now = ts_missing.swap(0, Ordering::Relaxed);
     if dropped_now > 0 {
         warn!("benchmark dropped {dropped_now} observations since last flush (channel full)");
+    }
+    if ts_missing_now > 0 {
+        warn!("benchmark skipped {ts_missing_now} packets with no kernel timestamp since last flush");
     }
     let want_influx = influx.is_some();
     let ts = now_unix_nanos();
@@ -434,6 +599,7 @@ fn emit(
             &[],
             &[
                 ("dropped_observations", dropped_now as i64),
+                ("ts_missing", ts_missing_now as i64),
                 ("series_tracked", acc.len() as i64),
                 ("leader_base_slot", leader_base_slot as i64),
             ],
@@ -642,6 +808,97 @@ fn append_vs_jito(
     );
 }
 
+/// Emit the pipeline-latency series (`shredstream_bench-pipeline`). Runs on the
+/// aggregator thread at flush; never touches the reconstruct hot path.
+fn emit_pipeline(acc: &PipelineAcc, pipeline_dropped: &AtomicU64, influx: Option<&InfluxWriter>) {
+    let dropped_now = pipeline_dropped.swap(0, Ordering::Relaxed);
+    let Some(w) = influx else {
+        // No influx sink: surface the headline in the log so the data isn't lost.
+        if acc.clean_n + acc.recovered_n > 0 {
+            let mut d = acc.clean_debt_ns.clone();
+            let q = quantiles(&mut d, &[0.5, 0.99]);
+            info!(
+                "pipeline latency (clean n={}, recovered n={}): debt p50={}us p99={}us | anomalies={} dropped={}",
+                acc.clean_n,
+                acc.recovered_n,
+                q[0] / 1000,
+                q[1] / 1000,
+                acc.clock_anomalies,
+                dropped_now,
+            );
+        }
+        return;
+    };
+    let ts = now_unix_nanos();
+    let mut buf = String::new();
+    append_pipeline(
+        &mut buf,
+        ts,
+        "clean",
+        &acc.clean_debt_ns,
+        Some(&acc.clean_spread_ns),
+        acc.clean_n,
+        acc.clock_anomalies,
+        dropped_now,
+        acc.unknown_start_excluded,
+    );
+    append_pipeline(
+        &mut buf,
+        ts,
+        "recovered",
+        &acc.recovered_debt_ns,
+        None,
+        acc.recovered_n,
+        0,
+        0,
+        0,
+    );
+    w.write(&buf);
+}
+
+/// `debt` = `T_publish - T_ready`; `spread` = `T_ready - T_first` (clean only).
+/// Both are non-negative; percentiles in microseconds.
+#[allow(clippy::too_many_arguments)]
+fn append_pipeline(
+    buf: &mut String,
+    ts: u128,
+    class: &str,
+    debt_ns: &[i64],
+    spread_ns: Option<&[i64]>,
+    n: u64,
+    clock_anomalies: u64,
+    dropped: u64,
+    unknown_start_excluded: u64,
+) {
+    let mut d = debt_ns.to_vec();
+    let dq = quantiles(&mut d, &[0.5, 0.9, 0.99]);
+    let dmax = d.iter().copied().max().unwrap_or(0);
+    let mut fields: Vec<(&str, i64)> = vec![
+        ("n", n as i64),
+        ("debt_p50_us", dq[0] / 1000),
+        ("debt_p90_us", dq[1] / 1000),
+        ("debt_p99_us", dq[2] / 1000),
+        ("debt_max_us", dmax / 1000),
+        ("clock_anomalies", clock_anomalies as i64),
+        ("dropped", dropped as i64),
+        ("unknown_start_excluded", unknown_start_excluded as i64),
+    ];
+    if let Some(s) = spread_ns {
+        let mut sv = s.to_vec();
+        let sq = quantiles(&mut sv, &[0.5, 0.9, 0.99]);
+        fields.push(("spread_p50_us", sq[0] / 1000));
+        fields.push(("spread_p90_us", sq[1] / 1000));
+        fields.push(("spread_p99_us", sq[2] / 1000));
+    }
+    append_point(
+        buf,
+        "shredstream_bench-pipeline",
+        &[("leader", "ALL"), ("class", class)],
+        &fields,
+        ts,
+    );
+}
+
 fn log_summary(global: &HashMap<SourceId, SourceAgg>, total: u64) {
     let mut rows: Vec<(SourceId, &SourceAgg)> = global.iter().map(|(k, v)| (*k, v)).collect();
     rows.sort_by_key(|(_, sa)| std::cmp::Reverse(sa.contested_firsts));
@@ -789,5 +1046,87 @@ mod tests {
         assert_eq!(va.delta_sum_ns, -300);
         // jito is the baseline; it must never be a vs_jito key.
         assert!(lagg.vs_jito.get(&SourceId::Jito).is_none());
+    }
+
+    // ---- pipeline-latency join (Design B) ----
+
+    fn ev(slot: Slot, start: u32, end: u32, unknown: bool, publish: i64) -> PublishEvent {
+        PublishEvent {
+            slot,
+            start_index: start,
+            end_index: end,
+            unknown_start: unknown,
+            publish_ts_ns: publish,
+        }
+    }
+
+    #[test]
+    fn pipeline_clean_sample() {
+        // All composing indices observed. T_ready = max arrival, T_first = min.
+        let mut m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
+        m.insert((100, 0), 1000);
+        m.insert((100, 1), 1500); // latest -> T_ready
+        m.insert((100, 2), 1200);
+        let mut acc = PipelineAcc::default();
+        process_publish_event(&ev(100, 0, 2, false, 1800), &m, &mut acc);
+        assert_eq!(acc.clean_n, 1);
+        assert_eq!(acc.recovered_n, 0);
+        assert_eq!(acc.clean_debt_ns, vec![1800 - 1500]); // publish - T_ready = 300
+        assert_eq!(acc.clean_spread_ns, vec![1500 - 1000]); // T_ready - T_first = 500
+    }
+
+    #[test]
+    fn pipeline_recovered_sample() {
+        // Index 1 was FEC-recovered (no observation) -> recovered class, approx debt
+        // anchored on the max observed arrival.
+        let mut m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
+        m.insert((100, 0), 1000);
+        m.insert((100, 2), 1200);
+        let mut acc = PipelineAcc::default();
+        process_publish_event(&ev(100, 0, 2, false, 1600), &m, &mut acc);
+        assert_eq!(acc.clean_n, 0);
+        assert_eq!(acc.recovered_n, 1);
+        assert_eq!(acc.recovered_debt_ns, vec![1600 - 1200]); // 400
+        assert!(acc.clean_spread_ns.is_empty()); // spread not defined for recovered
+    }
+
+    #[test]
+    fn pipeline_clock_anomaly_rejected() {
+        let mut m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
+        m.insert((100, 0), 2000);
+        let mut acc = PipelineAcc::default();
+        // negative debt (publish before ready)
+        process_publish_event(&ev(100, 0, 0, false, 1000), &m, &mut acc);
+        // absurd debt (> CAP)
+        process_publish_event(
+            &ev(100, 0, 0, false, 2000 + PIPELINE_MAX_PLAUSIBLE_NS + 1),
+            &m,
+            &mut acc,
+        );
+        assert_eq!(acc.clock_anomalies, 2);
+        assert_eq!(acc.clean_n, 0);
+        assert_eq!(acc.recovered_n, 0);
+    }
+
+    #[test]
+    fn pipeline_unknown_start_excluded() {
+        let m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
+        let mut acc = PipelineAcc::default();
+        process_publish_event(&ev(100, 0, 2, true, 5000), &m, &mut acc);
+        assert_eq!(acc.unknown_start_excluded, 1);
+        assert_eq!(acc.clean_n, 0);
+        assert_eq!(acc.recovered_n, 0);
+    }
+
+    #[test]
+    fn pipeline_fully_recovered_counts_no_sample() {
+        // No composing index observed (fully recovered / evicted): count it, but we
+        // have no arrival anchor to measure against, so no debt sample.
+        let m: ahash::HashMap<(Slot, u32), i64> = ahash::HashMap::default();
+        let mut acc = PipelineAcc::default();
+        process_publish_event(&ev(100, 5, 6, false, 9999), &m, &mut acc);
+        assert_eq!(acc.recovered_n, 1);
+        assert!(acc.recovered_debt_ns.is_empty());
+        assert_eq!(acc.clean_n, 0);
     }
 }
