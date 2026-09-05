@@ -1,5 +1,10 @@
 # Validator-Granularity Shred-Source Benchmark — Design
 
+**On-demand successor (2026-09-05):** see [benchmark-sessions.md](benchmark-sessions.md)
+for runtime-controlled, provider-independent sessions, the helper/report workflow,
+and the new `shredstream_bench-session-pair` measurement. The legacy design below
+still applies when `BENCHMARK_CONTROL_PATH` is unset.
+
 **Branch:** `validator-benching` (based on `proven-fixes`, the production branch).
 **Status:** built (M0–M4, TUI skipped), audited, committed to `validator-benching`. Jito auto-identified
 by IP (§15); direct InfluxDB v2 writer (§16). Not yet run against live traffic.

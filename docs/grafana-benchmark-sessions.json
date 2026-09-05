@@ -1,0 +1,58 @@
+{
+  "__inputs": [
+    {"name": "DS_INFLUX", "label": "InfluxDB (Flux)", "type": "datasource", "pluginId": "influxdb", "pluginName": "InfluxDB"}
+  ],
+  "title": "Shred source trial sessions",
+  "uid": "shred-bench-sessions",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "refresh": "1m",
+  "time": {"from": "now-30d", "to": "now"},
+  "tags": ["shredstream", "benchmark"],
+  "templating": {"list": [
+    {"name": "bucket", "label": "Bucket", "type": "textbox", "query": "shreds", "current": {"text": "shreds", "value": "shreds"}},
+    {"name": "min_contested", "label": "Minimum contested / validator", "type": "textbox", "query": "100", "current": {"text": "100", "value": "100"}},
+    {
+      "name": "session", "label": "Session", "type": "query", "refresh": 2,
+      "datasource": {"type": "influxdb", "uid": "${DS_INFLUX}"},
+      "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"${bucket}\", tag: \"session\", predicate: (r) => r._measurement == \"shredstream_bench-session-pair\", start: v.timeRangeStart, stop: v.timeRangeStop)",
+      "multi": false, "includeAll": false, "sort": 2
+    }
+  ]},
+  "panels": [
+    {
+      "id": 1, "type": "text", "title": "Reading a trial", "gridPos": {"x": 0, "y": 0, "w": 24, "h": 4},
+      "options": {"mode": "markdown", "content": "Select a session and a time range covering the trial. Data shreds only. Negative delta means the candidate arrived earlier. Savings measures adding the candidate alongside the baseline, on shared shreds. Missing-delivery counts use a finite matching window. No contested samples means no latency comparison. Check `bench.py status` or the session's `status.json` for feed presence, observation loss, output errors, and completion. These panels are not stake-weighted; use `bench.py report --votes` for that analysis."}
+    },
+    {
+      "id": 2, "type": "stat", "title": "Contested shreds", "gridPos": {"x": 0, "y": 4, "w": 6, "h": 5},
+      "datasource": {"type": "influxdb", "uid": "${DS_INFLUX}"},
+      "fieldConfig": {"defaults": {"unit": "short", "noValue": "No comparison"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "graphMode": "none", "colorMode": "value"},
+      "targets": [{"refId": "A", "query": "from(bucket: \"${bucket}\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"shredstream_bench-session-pair\" and r.session == \"${session}\" and r.shred_type == \"data\" and r.leader == \"ALL\" and r._field == \"contested\") |> group() |> sum()"}]
+    },
+    {
+      "id": 3, "type": "table", "title": "Global comparison (counts and sums across selected windows)", "gridPos": {"x": 6, "y": 4, "w": 18, "h": 5},
+      "datasource": {"type": "influxdb", "uid": "${DS_INFLUX}"},
+      "fieldConfig": {"defaults": {"decimals": 2, "noValue": "No comparison"}, "overrides": []},
+      "options": {"showHeader": true},
+      "targets": [{"refId": "A", "query": "from(bucket: \"${bucket}\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"shredstream_bench-session-pair\" and r.session == \"${session}\" and r.shred_type == \"data\" and r.leader == \"ALL\") |> filter(fn: (r) => r._field == \"contested\" or r._field == \"candidate_faster\" or r._field == \"delta_sum_us\" or r._field == \"time_saved_sum_us\") |> group(columns: [\"leader\", \"_field\"]) |> sum() |> group() |> pivot(rowKey: [\"leader\"], columnKey: [\"_field\"], valueColumn: \"_value\") |> filter(fn: (r) => r.contested > 0) |> map(fn: (r) => ({leader: r.leader, contested: r.contested, candidate_win_pct: 100.0 * float(v: r.candidate_faster) / float(v: r.contested), mean_delta_us: float(v: r.delta_sum_us) / float(v: r.contested), mean_savings_us: float(v: r.time_saved_sum_us) / float(v: r.contested)}))"}]
+    },
+    {
+      "id": 4, "type": "table", "title": "Per-validator comparison", "gridPos": {"x": 0, "y": 9, "w": 24, "h": 12},
+      "datasource": {"type": "influxdb", "uid": "${DS_INFLUX}"},
+      "fieldConfig": {"defaults": {"decimals": 2, "noValue": "No comparison"}, "overrides": []},
+      "options": {"showHeader": true, "sortBy": [{"displayName": "contested", "desc": true}]},
+      "targets": [{"refId": "A", "query": "from(bucket: \"${bucket}\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"shredstream_bench-session-pair\" and r.session == \"${session}\" and r.shred_type == \"data\" and r.leader != \"ALL\" and r.leader != \"unknown\") |> filter(fn: (r) => r._field == \"contested\" or r._field == \"candidate_faster\" or r._field == \"delta_sum_us\" or r._field == \"time_saved_sum_us\") |> group(columns: [\"leader\", \"_field\"]) |> sum() |> group() |> pivot(rowKey: [\"leader\"], columnKey: [\"_field\"], valueColumn: \"_value\") |> filter(fn: (r) => r.contested > 0 and r.contested >= int(v: \"${min_contested}\")) |> map(fn: (r) => ({leader: r.leader, contested: r.contested, candidate_win_pct: 100.0 * float(v: r.candidate_faster) / float(v: r.contested), mean_delta_us: float(v: r.delta_sum_us) / float(v: r.contested), mean_savings_us: float(v: r.time_saved_sum_us) / float(v: r.contested)})) |> sort(columns: [\"contested\"], desc: true) |> limit(n: 2000)"}]
+    },
+    {
+      "id": 5, "type": "table", "title": "Delivery coverage and clock anomalies (includes uncontested leaders)", "gridPos": {"x": 0, "y": 21, "w": 24, "h": 10},
+      "datasource": {"type": "influxdb", "uid": "${DS_INFLUX}"},
+      "fieldConfig": {"defaults": {"decimals": 0}, "overrides": []},
+      "options": {"showHeader": true},
+      "targets": [{"refId": "A", "query": "from(bucket: \"${bucket}\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop) |> filter(fn: (r) => r._measurement == \"shredstream_bench-session-pair\" and r.session == \"${session}\" and r.shred_type == \"data\") |> filter(fn: (r) => r._field == \"both_delivered\" or r._field == \"baseline_only\" or r._field == \"candidate_only\" or r._field == \"clock_anomalies\") |> group(columns: [\"leader\", \"_field\"]) |> sum() |> group() |> pivot(rowKey: [\"leader\"], columnKey: [\"_field\"], valueColumn: \"_value\") |> sort(columns: [\"leader\"]) |> limit(n: 2000)"}]
+    }
+  ]
+}

@@ -30,11 +30,11 @@ use solana_sdk::{clock::Slot, pubkey::Pubkey};
 use super::{
     influx::{append_point, InfluxWriter},
     leader::LeaderScheduleHandle,
-    parse::{Observation, ShredId},
+    parse::ShredId,
     sources::{self, SourceId},
     stats::{basis_points, mean, quantiles},
     validators::ValidatorMap,
-    BenchmarkConfig,
+    BenchmarkConfig, ObservationBatch,
 };
 
 fn now_unix_nanos() -> u128 {
@@ -327,7 +327,7 @@ type AccKey = (LeaderKey, bool);
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    rx: Receiver<Vec<Observation>>,
+    rx: Receiver<ObservationBatch>,
     cfg: BenchmarkConfig,
     leader: Option<LeaderScheduleHandle>,
     validators: Option<Arc<ValidatorMap>>,
@@ -335,6 +335,7 @@ pub fn run(
     ts_missing: Arc<AtomicU64>,
     pipeline_rx: Option<Receiver<PublishEvent>>,
     pipeline_dropped: Arc<AtomicU64>,
+    race_epoch: Arc<AtomicU64>,
     exit: Arc<AtomicBool>,
 ) {
     let mut map: ahash::HashMap<ShredId, PerSourceArrival> = ahash::HashMap::default();
@@ -354,6 +355,10 @@ pub fn run(
 
     let mut csv = open_csv(&cfg);
     let influx = cfg.influx.as_ref().and_then(InfluxWriter::new);
+    let mut sessions = cfg.control_path.as_ref().map(|path| {
+        super::session::Controller::new(path.clone(), race_epoch.clone(), &cfg)
+    });
+    let mut previous_epoch = race_epoch.load(Ordering::Relaxed);
 
     let sweep_interval = Duration::from_secs(1);
     let mut last_sweep = Instant::now();
@@ -371,15 +376,26 @@ pub fn run(
     );
 
     while !exit.load(Ordering::Relaxed) {
+        if let Some(s) = sessions.as_mut() {
+            s.health(&dropped, &ts_missing);
+            s.tick(leader.as_ref(), influx.as_ref());
+            let epoch = race_epoch.load(Ordering::Relaxed);
+            if epoch != previous_epoch && !pipeline_on {
+                // A monthly idle gap must not trip the no-RPC MAX_SLOT_JUMP
+                // guard. Pipeline state/frontier are left alone when enabled.
+                current_max_slot = 0;
+            }
+            previous_epoch = epoch;
+        }
         let leader_bounds = leader.as_ref().and_then(|h| h.bounds());
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(batch) => {
-                ingest(&mut map, &mut data_rx, pipeline_on, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds);
+                ingest(&mut map, &mut data_rx, pipeline_on, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds, sessions.as_mut());
                 let mut drained = 1;
                 while drained < DRAIN_CAP {
                     match rx.try_recv() {
                         Ok(batch) => {
-                            ingest(&mut map, &mut data_rx, pipeline_on, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds);
+                            ingest(&mut map, &mut data_rx, pipeline_on, &mut current_max_slot, &cfg, &mut csv, batch, leader_bounds, sessions.as_mut());
                             drained += 1;
                         }
                         Err(_) => break,
@@ -444,10 +460,18 @@ pub fn run(
                 emit_pipeline(&pipeline_acc, &pipeline_dropped, &dropped, &ts_missing, influx.as_ref());
                 pipeline_acc = PipelineAcc::default();
             }
-            emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, &ts_missing, influx.as_ref());
+            let (flushed_drops, flushed_missing) = emit(&acc, validators.as_deref(), leader.as_ref(), &cfg, &dropped, &ts_missing, influx.as_ref());
+            if let Some(s) = sessions.as_mut() {
+                s.flushed_health(flushed_drops, flushed_missing);
+            }
             acc.clear();
             last_flush = Instant::now();
         }
+    }
+
+    if let Some(s) = sessions.as_mut() {
+        s.health(&dropped, &ts_missing);
+        s.shutdown(leader.as_ref(), influx.as_ref());
     }
 
     sweep_finalize(&mut map, current_max_slot, 0, leader.as_ref(), &mut acc);
@@ -484,10 +508,16 @@ fn ingest(
     current_max_slot: &mut Slot,
     cfg: &BenchmarkConfig,
     csv: &mut Option<BufWriter<std::fs::File>>,
-    batch: Vec<Observation>,
+    batch: ObservationBatch,
     leader_bounds: Option<(Slot, Slot)>,
+    mut sessions: Option<&mut super::session::Controller>,
 ) {
-    for obs in batch {
+    if !pipeline_on && sessions.as_ref().is_some_and(|s| !s.accepts_epoch(batch.epoch)) {
+        // Reject stale batches BEFORE they can seed/advance the slot frontier.
+        // Pipeline telemetry still needs its independent arrival stream.
+        return;
+    }
+    for obs in batch.observations {
         if let Some(w) = csv.as_mut() {
             let _ = writeln!(
                 w,
@@ -520,6 +550,10 @@ fn ingest(
                 .or_insert(obs.rx_ts_ns);
         }
         if cfg.data_only && !obs.is_data {
+            continue;
+        }
+        if let Some(s) = sessions.as_mut() {
+            s.observe(batch.epoch, &obs);
             continue;
         }
         map.entry(obs.shred_id())
@@ -648,7 +682,7 @@ fn emit(
     dropped: &AtomicU64,
     ts_missing: &AtomicU64,
     influx: Option<&InfluxWriter>,
-) {
+) -> (u64, u64) {
     let dropped_now = dropped.swap(0, Ordering::Relaxed);
     let ts_missing_now = ts_missing.swap(0, Ordering::Relaxed);
     if dropped_now > 0 {
@@ -747,6 +781,7 @@ fn emit(
     if global_total >= cfg.min_samples {
         log_summary(&global_source, global_total);
     }
+    (dropped_now, ts_missing_now)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -992,6 +1027,12 @@ fn log_summary(global: &HashMap<SourceId, SourceAgg>, total: u64) {
 }
 
 fn open_csv(cfg: &BenchmarkConfig) -> Option<BufWriter<std::fs::File>> {
+    if cfg.control_path.is_some() {
+        if cfg.csv_path.is_some() {
+            warn!("session mode ignores BENCHMARK_CSV_PATH; request bounded CSV per session instead");
+        }
+        return None;
+    }
     let path = cfg.csv_path.as_ref()?;
     match std::fs::File::create(path) {
         Ok(f) => {
@@ -1116,7 +1157,7 @@ mod tests {
         assert_eq!(va.beats, 1);
         assert_eq!(va.delta_sum_ns, -300);
         // jito is the baseline; it must never be a vs_jito key.
-        assert!(lagg.vs_jito.get(&SourceId::Jito).is_none());
+        assert!(!lagg.vs_jito.contains_key(&SourceId::Jito));
     }
 
     // ---- pipeline-latency join (Design B) ----

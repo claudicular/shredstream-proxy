@@ -16,6 +16,7 @@ pub mod influx;
 pub mod leader;
 pub mod parse;
 pub mod recv_timestamp;
+pub mod session;
 pub mod sources;
 pub mod stats;
 pub mod validators;
@@ -57,6 +58,11 @@ pub struct BenchmarkArgs {
     /// Path to write a raw per-observation CSV dump (milestone M1). Optional.
     #[arg(long, env)]
     pub benchmark_csv_path: Option<PathBuf>,
+
+    /// Enable on-demand sessions controlled by this JSON file. Starts idle;
+    /// legacy continuous race/CSV output is disabled. Requires enable-benchmark.
+    #[arg(long, env)]
+    pub benchmark_control_path: Option<PathBuf>,
 
     /// RPC URL used to fetch the leader schedule (getSlotLeaders). When unset,
     /// per-validator bucketing is disabled (stats still computed globally).
@@ -135,6 +141,7 @@ impl BenchmarkArgs {
             kernel_timestamps: self.benchmark_kernel_timestamps,
             data_only: !self.benchmark_include_coding,
             csv_path: self.benchmark_csv_path.clone(),
+            control_path: self.benchmark_control_path.clone(),
             rpc_url: self.rpc_url.clone(),
             validator_map_path: self.validator_map_path.clone(),
             node_country: self.node_country.clone(),
@@ -167,6 +174,7 @@ pub struct BenchmarkConfig {
     pub kernel_timestamps: bool,
     pub data_only: bool,
     pub csv_path: Option<PathBuf>,
+    pub control_path: Option<PathBuf>,
     pub rpc_url: Option<String>,
     pub validator_map_path: Option<PathBuf>,
     pub node_country: String,
@@ -186,12 +194,21 @@ pub struct BenchmarkConfig {
 /// `try_send`; on overflow it drops and counts, never blocks.
 #[derive(Clone)]
 pub struct BenchmarkHandle {
-    sender: Sender<Vec<Observation>>,
+    sender: Sender<ObservationBatch>,
+    /// Zero means race collection is idle. Stamped once per batch so queued
+    /// observations cannot cross session boundaries. No source lookup or locks.
+    race_epoch: Arc<AtomicU64>,
+    pipeline_on: bool,
     dropped: Arc<AtomicU64>,
     /// Packets whose kernel timestamp was unavailable (cmsg missing, ts <= 0) and
     /// were therefore skipped rather than folded into the latency series with a
     /// fake dequeue time. Surfaced in the `-health` series.
     ts_missing: Arc<AtomicU64>,
+}
+
+pub struct ObservationBatch {
+    pub epoch: u64,
+    pub observations: Vec<Observation>,
 }
 
 impl BenchmarkHandle {
@@ -211,6 +228,10 @@ impl BenchmarkHandle {
         rx_ts_ns: i64,
         source_override: Option<IpAddr>,
     ) {
+        let epoch = self.race_epoch.load(Ordering::Relaxed);
+        if epoch == 0 && !self.pipeline_on {
+            return;
+        }
         // Skip a batch with no valid receive timestamp rather than recording a
         // bogus (~0-latency) sample; count it so the loss is visible.
         if rx_ts_ns <= 0 {
@@ -227,7 +248,7 @@ impl BenchmarkHandle {
                 }
             }
         }
-        self.push(obs);
+        self.push(epoch, obs);
     }
 
     /// Tap packets with per-packet kernel timestamps. Used by the timestamped
@@ -244,6 +265,10 @@ impl BenchmarkHandle {
         ts: &[i64],
         source_override: Option<IpAddr>,
     ) {
+        let epoch = self.race_epoch.load(Ordering::Relaxed);
+        if epoch == 0 && !self.pipeline_on {
+            return;
+        }
         let mut obs = Vec::with_capacity(packets.len());
         for (pkt, &t) in packets.iter().zip(ts.iter()) {
             // ts <= 0 is the "no kernel timestamp" sentinel (cmsg missing); skip
@@ -259,16 +284,16 @@ impl BenchmarkHandle {
                 }
             }
         }
-        self.push(obs);
+        self.push(epoch, obs);
     }
 
     #[inline]
-    fn push(&self, obs: Vec<Observation>) {
+    fn push(&self, epoch: u64, obs: Vec<Observation>) {
         if obs.is_empty() {
             return;
         }
         let n = obs.len() as u64;
-        if self.sender.try_send(obs).is_err() {
+        if self.sender.try_send(ObservationBatch { epoch, observations: obs }).is_err() {
             // Count dropped observations (not batches) so the metric reflects
             // true sample loss under overload.
             self.dropped.fetch_add(n, Ordering::Relaxed);
@@ -331,6 +356,9 @@ pub struct BenchmarkRuntime {
 /// leader-schedule poller (if an RPC URL is set) and the aggregator thread.
 pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<BenchmarkRuntime> {
     if !config.enabled {
+        if config.control_path.is_some() {
+            warn!("BENCHMARK_CONTROL_PATH ignored: it requires --enable-benchmark");
+        }
         if config.pipeline_latency {
             warn!("--enable-pipeline-latency ignored: it requires --enable-benchmark");
         }
@@ -346,9 +374,10 @@ pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<Benchmark
         );
     }
 
-    let (sender, receiver) = crossbeam_channel::bounded::<Vec<Observation>>(config.channel_capacity);
+    let (sender, receiver) = crossbeam_channel::bounded::<ObservationBatch>(config.channel_capacity);
     let dropped = Arc::new(AtomicU64::new(0));
     let ts_missing = Arc::new(AtomicU64::new(0));
+    let race_epoch = Arc::new(AtomicU64::new(if config.control_path.is_some() { 0 } else { 1 }));
 
     // Pipeline-latency path (optional). Requires kernel timestamps: it measures
     // shred arrival -> shmem/gRPC publish, and a meaningful arrival clock needs the
@@ -414,6 +443,7 @@ pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<Benchmark
     let agg_exit = exit.clone();
     let agg_validators = validators.clone();
     let agg_core = config.aggregator_core_id;
+    let agg_epoch = race_epoch.clone();
     let agg_join = std::thread::Builder::new()
         .name("ssBenchAgg".to_string())
         .spawn(move || {
@@ -429,6 +459,7 @@ pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<Benchmark
                 agg_ts_missing,
                 pipeline_rx,
                 agg_pipeline_dropped,
+                agg_epoch,
                 agg_exit,
             );
         })
@@ -440,9 +471,71 @@ pub fn start(config: BenchmarkConfig, exit: Arc<AtomicBool>) -> Option<Benchmark
             sender,
             dropped,
             ts_missing,
+            race_epoch,
+            pipeline_on,
         },
         kernel_timestamps: config.kernel_timestamps,
         pipeline_handle,
         join_handles,
     })
+}
+
+#[cfg(test)]
+mod tap_tests {
+    use super::*;
+
+    fn handle(pipeline_on: bool) -> (BenchmarkHandle, crossbeam_channel::Receiver<ObservationBatch>) {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        (BenchmarkHandle { sender, race_epoch: Arc::new(AtomicU64::new(0)), pipeline_on,
+            dropped: Arc::new(AtomicU64::new(0)), ts_missing: Arc::new(AtomicU64::new(0)) }, receiver)
+    }
+
+    fn packet() -> Packet {
+        let mut p = Packet::default();
+        p.meta_mut().size = parse::SIZE_OF_COMMON_HEADER;
+        p.meta_mut().addr = "10.0.0.1".parse().unwrap();
+        p.buffer_mut()[parse::OFFSET_SHRED_VARIANT] = 0xa5;
+        p.buffer_mut()[parse::OFFSET_SLOT..parse::OFFSET_SLOT + 8].copy_from_slice(&100u64.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn idle_tap_skips_parsing_and_timestamp_accounting() {
+        let (h, rx) = handle(false);
+        h.observe_packets(&[packet()], &[0]);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(h.ts_missing.load(Ordering::Relaxed), 0);
+        assert_eq!(h.dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn session_epoch_is_stamped_before_queueing_and_packets_are_untouched() {
+        let (h, rx) = handle(false);
+        let p = packet(); let before = p.data(..).unwrap().to_vec();
+        h.race_epoch.store(7, Ordering::Relaxed);
+        h.observe_packets(std::slice::from_ref(&p), &[1000]);
+        h.race_epoch.store(9, Ordering::Relaxed);
+        let batch = rx.try_recv().unwrap();
+        assert_eq!(batch.epoch, 7);
+        assert_eq!(batch.observations.len(), 1);
+        assert_eq!(p.data(..).unwrap(), before);
+        assert!(!p.meta().discard());
+    }
+
+    #[test]
+    fn pipeline_observations_continue_while_races_idle_and_full_channel_drops() {
+        let (h, rx) = handle(true);
+        h.observe_packets(&[packet()], &[1000]);
+        h.observe_packets(&[packet()], &[2000]);
+        assert_eq!(h.dropped.load(Ordering::Relaxed), 1);
+        let batch = rx.try_recv().unwrap();
+        assert_eq!(batch.epoch, 0);
+        assert_eq!(batch.observations[0].rx_ts_ns, 1000);
+        h.race_epoch.store(2, Ordering::Relaxed);
+        h.observe_packets(&[packet()], &[3000]);
+        assert_eq!(rx.try_recv().unwrap().epoch, 2);
+        h.race_epoch.store(0, Ordering::Relaxed);
+        h.observe_packets(&[packet()], &[4000]);
+        assert_eq!(rx.try_recv().unwrap().observations.len(), 1);
+    }
 }

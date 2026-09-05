@@ -20,3 +20,11 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-features --locked
+
+      - name: Benchmark helper tests
+        run: python3 -m unittest discover -s scripts -p test_bench.py -v
+
+      - name: Benchmark runtime and forwarding smoke test
+        run: |
+          cargo build --locked -p jito-shredstream-proxy
+          BENCH_PROXY_BIN="$PWD/target/debug/jito-shredstream-proxy" python3 -m unittest discover -s scripts -p test_bench_proxy.py -v
