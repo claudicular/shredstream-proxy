@@ -240,6 +240,8 @@ fn main() -> Result<(), ShredstreamProxyError> {
         ProxySubcommands::Shredstream(x) => x.common_args,
         ProxySubcommands::ForwardOnly(x) => x,
     };
+    let should_reconstruct_entries =
+        args.grpc_service_port.is_some() || args.shmem_ring_path.is_some();
     set_host_id(hostname::get()?.into_string().unwrap());
     if (args.endpoint_discovery_url.is_none() && args.discovered_endpoints_port.is_some())
         || (args.endpoint_discovery_url.is_some() && args.discovered_endpoints_port.is_none())
@@ -249,8 +251,9 @@ fn main() -> Result<(), ShredstreamProxyError> {
     if args.endpoint_discovery_url.is_none()
         && args.discovered_endpoints_port.is_none()
         && args.dest_ip_ports.is_empty()
+        && !should_reconstruct_entries
     {
-        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "No destinations found. You must provide values for --dest-ip-ports or --endpoint-discovery-url.")));
+        return Err(ShredstreamProxyError::IoError(io::Error::new(ErrorKind::InvalidInput, "No outputs configured. Provide --dest-ip-ports, --endpoint-discovery-url, --grpc-service-port, or --shmem-ring-path.")));
     }
 
     let exit = Arc::new(AtomicBool::new(false));
@@ -269,7 +272,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         }));
     }
 
-    let metrics = Arc::new(ShredMetrics::new(args.grpc_service_port.is_some()));
+    let metrics = Arc::new(ShredMetrics::new(should_reconstruct_entries));
 
     let runtime = Runtime::new()?;
     let mut thread_handles = vec![];
@@ -329,7 +332,7 @@ fn main() -> Result<(), ShredstreamProxyError> {
         maybe_multicast_socket,
         args.num_threads,
         deduper.clone(),
-        args.grpc_service_port.is_some(),
+        should_reconstruct_entries,
         entry_sender.clone(),
         args.debug_trace_shred,
         use_discovery_service,
