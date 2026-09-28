@@ -653,6 +653,21 @@ pub struct ShredMetrics {
     pub unknown_start_position_count: AtomicU64,
     /// Number of FEC recovery errors
     pub fec_recovery_error_count: AtomicU64,
+    /// Reed-Solomon recovery attempts that failed (`merkle::recover` error)
+    pub fec_recovery_failed_count: AtomicU64,
+    /// Recovery attempts on an FEC set holding shreds of more than one signed version
+    /// (different leader signatures for one (slot, fec_set_index))
+    pub fec_recovery_mixed_version_count: AtomicU64,
+    /// Shreds left out of a recovery because their own Merkle proof does not lead to the
+    /// root the rest of their version agrees on
+    pub fec_recovery_bad_shred_count: AtomicU64,
+    /// Recoveries that succeeded only after using one version and dropping bad shreds
+    pub fec_recovery_regrouped_count: AtomicU64,
+    /// Recovery attempts skipped because the set has not grown enough since it last failed
+    pub fec_recovery_retry_skipped_count: AtomicU64,
+    /// Complete batches held back because an FEC set in them mixes data shreds of two
+    /// signed versions (released once recovery replaces the minority version)
+    pub mixed_version_batch_held_count: AtomicU64,
     /// Number of bincode Entry deserialization errors
     pub bincode_deserialize_error_count: AtomicU64,
     /// Number of times we couldn't find the previous DATA_COMPLETE_SHRED flag but tried to deshred+deserialize, and failed
@@ -704,6 +719,12 @@ impl ShredMetrics {
             txn_count: Default::default(),
             unknown_start_position_count: Default::default(),
             fec_recovery_error_count: Default::default(),
+            fec_recovery_failed_count: Default::default(),
+            fec_recovery_mixed_version_count: Default::default(),
+            fec_recovery_bad_shred_count: Default::default(),
+            fec_recovery_regrouped_count: Default::default(),
+            fec_recovery_retry_skipped_count: Default::default(),
+            mixed_version_batch_held_count: Default::default(),
             bincode_deserialize_error_count: Default::default(),
             unknown_start_position_error_count: Default::default(),
             unknown_start_mid_fec_count: Default::default(),
@@ -771,6 +792,39 @@ impl ShredMetrics {
                 (
                     "fec_recovery_error_count",
                     self.fec_recovery_error_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "fec_recovery_failed_count",
+                    self.fec_recovery_failed_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "fec_recovery_mixed_version_count",
+                    self.fec_recovery_mixed_version_count
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "fec_recovery_bad_shred_count",
+                    self.fec_recovery_bad_shred_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "fec_recovery_regrouped_count",
+                    self.fec_recovery_regrouped_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "fec_recovery_retry_skipped_count",
+                    self.fec_recovery_retry_skipped_count
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "mixed_version_batch_held_count",
+                    self.mixed_version_batch_held_count
+                        .swap(0, Ordering::Relaxed),
                     i64
                 ),
                 (

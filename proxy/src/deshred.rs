@@ -17,7 +17,11 @@ use solana_ledger::{
     },
 };
 use solana_metrics::datapoint_warn;
-use solana_sdk::clock::{Slot, MAX_PROCESSING_AGE};
+use solana_sdk::{
+    clock::{Slot, MAX_PROCESSING_AGE},
+    hash::Hash as BlockHash,
+    signature::Signature,
+};
 
 use crate::{
     entry_walk::{self, BatchKind},
@@ -51,6 +55,9 @@ pub struct ShredsStateTracker {
     /// fixed until the shred before its start arrives, and that arrival changes the
     /// candidate start, so a set bit means "retrying this exact guess is pointless".
     rejected_guess_starts: Vec<u64>,
+    /// FEC set index -> number of shreds the set held when its last recovery attempt
+    /// failed. The next attempt waits for `RECOVERY_RETRY_STEP` more shreds.
+    failed_recovery_len: ahash::HashMap<u32, usize>,
 }
 impl Default for ShredsStateTracker {
     fn default() -> Self {
@@ -60,6 +67,7 @@ impl Default for ShredsStateTracker {
             already_recovered_fec_sets: vec![false; MAX_DATA_SHREDS_PER_SLOT],
             already_deshredded: vec![false; MAX_DATA_SHREDS_PER_SLOT],
             rejected_guess_starts: vec![0; MAX_DATA_SHREDS_PER_SLOT.div_ceil(64)],
+            failed_recovery_len: ahash::HashMap::default(),
         }
     }
 }
@@ -190,6 +198,22 @@ pub fn reconstruct_shred_payloads<'a>(
                     continue;
                 }
                 let Some(_shred_index) = update_state_tracker(&shred, state_tracker) else {
+                    // A data shred for an index the tracker already holds from another
+                    // signed version of this set: keep it where version-aware recovery can
+                    // see it (the set), not in the tracker.
+                    if shred.shred_type() == ShredType::Data
+                        && state_tracker.data_shreds[index]
+                            .as_ref()
+                            .is_some_and(|held| {
+                                held.common_header().signature != shred.common_header().signature
+                            })
+                    {
+                        all_shreds
+                            .entry(fec_set_index)
+                            .or_default()
+                            .insert(ComparableShred(shred));
+                        slot_fec_indexes_to_iterate.push((slot, fec_set_index));
+                    }
                     continue;
                 };
                 if shred.shred_type() == ShredType::Data
@@ -231,49 +255,110 @@ pub fn reconstruct_shred_payloads<'a>(
 
         // haven't received last data shred, haven't seen any coding shreds, so wait until more arrive
         let min_shreds_needed_to_recover = num_expected_data_shreds as usize;
-        if num_expected_data_shreds == 0
-            || shreds.len() < min_shreds_needed_to_recover
-            || num_data_shreds == num_expected_data_shreds
-        {
+        if num_expected_data_shreds == 0 || shreds.len() < min_shreds_needed_to_recover {
             continue;
         }
+        let single_version = is_single_version(shreds);
+        // All data shreds present, and all of one signed version: nothing to recover.
+        if num_data_shreds == num_expected_data_shreds && single_version {
+            continue;
+        }
+        if !single_version {
+            metrics
+                .fec_recovery_mixed_version_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(&failed_len) = state_tracker.failed_recovery_len.get(fec_set_index) {
+            if shreds.len() < failed_len + RECOVERY_RETRY_STEP {
+                metrics
+                    .fec_recovery_retry_skipped_count
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
 
-        // try to recover if we have enough shreds in the FEC set
-        let merkle_shreds = shreds
-            .iter()
-            .sorted_by_key(|s| (u8::MAX - s.shred_type() as u8, s.index()))
-            .map(|s| s.0.clone())
-            .collect_vec();
-        let recovered = match solana_ledger::shred::merkle::recover(merkle_shreds, rs_cache) {
-            Ok(r) => r, // data shreds followed by code shreds (whatever was missing from to_deshred_payload)
-            Err(e) => {
-                warn!(
-                    "Failed to recover shreds for slot {slot} fec_set_index {fec_set_index}. num_expected_data_shreds: {num_expected_data_shreds}, num_data_shreds: {num_data_shreds} num_expected_coding_shreds: {num_expected_coding_shreds} num_coding_shreds: {num_coding_shreds} Err: {e}",
-                );
+        let (recovered, version_data, regrouped) = match recover_fec_set(
+            shreds,
+            single_version,
+            rs_cache,
+            metrics,
+        ) {
+            RecoverOutcome::Recovered {
+                recovered,
+                version_data,
+                regrouped,
+            } => (recovered, version_data, regrouped),
+            RecoverOutcome::NotEnough => continue,
+            RecoverOutcome::Failed {
+                error,
+                versions,
+                bad_shreds,
+            } => {
+                metrics
+                    .fec_recovery_failed_count
+                    .fetch_add(1, Ordering::Relaxed);
+                state_tracker
+                    .failed_recovery_len
+                    .insert(*fec_set_index, shreds.len());
+                static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+                static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+                if warn_allowed(&LAST_WARN_SECS) {
+                    warn!(
+                        "Failed to recover shreds for slot {slot} fec_set_index {fec_set_index}. num_expected_data_shreds: {num_expected_data_shreds}, num_data_shreds: {num_data_shreds} num_expected_coding_shreds: {num_expected_coding_shreds} num_coding_shreds: {num_coding_shreds} versions (data+coding per leader signature): {versions} bad shreds: {bad_shreds} Err: {error} ({} similar failures suppressed since the last report)",
+                        SUPPRESSED.swap(0, Ordering::Relaxed)
+                    );
+                } else {
+                    SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+                }
                 continue;
             }
         };
+        if regrouped {
+            metrics
+                .fec_recovery_regrouped_count
+                .fetch_add(1, Ordering::Relaxed);
+            // Received data shreds of the recovered version replace another version's
+            // shreds accepted first at the same index.
+            for shred in &version_data {
+                let index = shred.index() as usize;
+                if state_tracker.data_shreds[index]
+                    .as_ref()
+                    .is_some_and(|held| {
+                        held.common_header().signature != shred.common_header().signature
+                    })
+                {
+                    replace_data_shred(shred, state_tracker);
+                }
+            }
+        }
+        state_tracker.failed_recovery_len.remove(fec_set_index);
 
         let mut fec_set_recovered_count = 0;
         for shred in recovered {
-            match shred {
-                Ok(shred) => {
-                    let Some(index) = update_state_tracker(&shred, state_tracker) else {
-                        continue; // already seen before in state tracker
-                    };
-                    if shred.shred_type() == ShredType::Data
-                        && state_tracker.data_status[index] == ShredStatus::DataComplete
-                    {
-                        proven_starts.push((*slot, index as u32 + 1));
-                    }
-                    // shreds.insert(ComparableShred(shred)); // optional since all data shreds are in state_tracker
-                    total_recovered_count += 1;
-                    fec_set_recovered_count += 1;
-                }
-                Err(e) => warn!(
-                    "Failed to recover shred for slot {slot}, fec set: {fec_set_index}. Err: {e}"
-                ),
+            let index = shred.index() as usize;
+            let installed = if regrouped
+                && shred.shred_type() == ShredType::Data
+                && state_tracker.data_shreds[index].is_some()
+            {
+                // The index holds a shred of another version (or a corrupted copy) that
+                // was accepted first. The recovered shred is the recovered version's own:
+                // the rebuilt Merkle tree matched its signed root.
+                replace_data_shred(&shred, state_tracker);
+                true
+            } else {
+                update_state_tracker(&shred, state_tracker).is_some()
+            };
+            if !installed {
+                continue; // already seen before in state tracker
             }
+            if shred.shred_type() == ShredType::Data
+                && state_tracker.data_status[index] == ShredStatus::DataComplete
+            {
+                proven_starts.push((*slot, index as u32 + 1));
+            }
+            // shreds.insert(ComparableShred(shred)); // optional since all data shreds are in state_tracker
+            total_recovered_count += 1;
+            fec_set_recovered_count += 1;
         }
 
         if fec_set_recovered_count > 0 {
@@ -326,6 +411,15 @@ pub fn reconstruct_shred_payloads<'a>(
 
         let to_deshred =
             &state_tracker.data_shreds[start_data_complete_idx..=end_data_complete_idx];
+        // Every data shred of one FEC set carries the leader's signature of that set's
+        // Merkle root. Two signatures within a set means two versions were spliced
+        // together: hold the batch until recovery replaces the minority version.
+        if !fec_sets_single_version(to_deshred) {
+            metrics
+                .mixed_version_batch_held_count
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let deshredded_payload = match Shredder::deshred(
             to_deshred.iter().map(|s| s.as_ref().unwrap().payload()),
         ) {
@@ -478,6 +572,225 @@ pub fn reconstruct_shred_payloads<'a>(
     total_recovered_count
 }
 
+/// After a recovery attempt fails, wait for this many more shreds of the set before the
+/// next one (a packet batch usually brings several), so an unrecoverable set costs a few
+/// Reed-Solomon attempts instead of one per arriving shred.
+const RECOVERY_RETRY_STEP: usize = 4;
+
+enum RecoverOutcome {
+    /// `recovered`: shreds missing from the version used (data and coding).
+    /// `version_data`: that version's received data shreds (only when `regrouped`).
+    /// `regrouped`: other versions or bad copies were left out, so the version's data
+    /// shreds replace whatever the tracker holds at their indexes.
+    Recovered {
+        recovered: Vec<Shred>,
+        version_data: Vec<Shred>,
+        regrouped: bool,
+    },
+    /// No single version has enough shreds yet; nothing was attempted.
+    NotEnough,
+    Failed {
+        error: solana_ledger::shred::Error,
+        versions: String,
+        bad_shreds: usize,
+    },
+}
+
+/// Every shred of the set carries the same leader signature.
+fn is_single_version(shreds: &HashSet<ComparableShred>) -> bool {
+    let mut iter = shreds.iter();
+    let Some(first) = iter.next() else {
+        return true;
+    };
+    let signature = &first.common_header().signature;
+    iter.all(|s| &s.common_header().signature == signature)
+}
+
+/// Within each FEC set, every data shred of `run` carries the same leader signature.
+fn fec_sets_single_version(run: &[Option<Shred>]) -> bool {
+    let mut current: Option<(u32, &Signature)> = None;
+    for shred in run.iter().flatten() {
+        let fec_set_index = shred.fec_set_index();
+        let signature = &shred.common_header().signature;
+        match current {
+            Some((fec, sig)) if fec == fec_set_index => {
+                if sig != signature {
+                    return false;
+                }
+            }
+            _ => current = Some((fec_set_index, signature)),
+        }
+    }
+    true
+}
+
+/// Reed-Solomon recovery of one FEC set's missing shreds.
+///
+/// A set is keyed by (slot, fec_set_index) only, so it can hold shreds that do not belong
+/// to one signed version of it: shreds of another version (another leader signature, so
+/// another Merkle root) and copies whose bytes inside the erasure shard no longer match the
+/// proof they carry (`ComparableShred` ignores the bytes outside `data`, so whichever copy
+/// arrived first is kept). `merkle::recover` rejects either with `InvalidMerkleRoot`.
+///
+/// Fast path, unchanged: a single-signature set goes to `merkle::recover` whole. Otherwise
+/// the largest signature group is recovered on its own. If recovery still fails, each
+/// shred's own proof is followed to its root (about a microsecond of SHA-256 per shred),
+/// shreds disagreeing with the group's majority root are dropped, and recovery runs once
+/// more.
+fn recover_fec_set(
+    shreds: &HashSet<ComparableShred>,
+    single_version: bool,
+    rs_cache: &ReedSolomonCache,
+    metrics: &ShredMetrics,
+) -> RecoverOutcome {
+    let sorted = |group: &mut Vec<&Shred>| {
+        group.sort_by_key(|s| (u8::MAX - s.shred_type() as u8, s.index()));
+    };
+    let mut groups: Vec<(Signature, Vec<&Shred>)> = Vec::new();
+    for shred in shreds.iter().map(|s| &s.0) {
+        let signature = shred.common_header().signature;
+        match groups.iter_mut().find(|(sig, _)| *sig == signature) {
+            Some((_, group)) => group.push(shred),
+            None => groups.push((signature, vec![shred])),
+        }
+    }
+    let versions = || {
+        groups
+            .iter()
+            .map(|(sig, g)| {
+                let data = g
+                    .iter()
+                    .filter(|s| s.shred_type() == ShredType::Data)
+                    .count();
+                format!("{}..:{}+{}", &sig.to_string()[..8], data, g.len() - data)
+            })
+            .join(", ")
+    };
+    // The largest version; on a tie, the one with more data shreds (the tracker's).
+    let Some((_, group)) = groups.iter().max_by_key(|(_, g)| {
+        let data = g
+            .iter()
+            .filter(|s| s.shred_type() == ShredType::Data)
+            .count();
+        (g.len(), data)
+    }) else {
+        return RecoverOutcome::NotEnough;
+    };
+    let mut group = group.clone();
+    if !has_enough_to_recover(&group) {
+        return RecoverOutcome::NotEnough;
+    }
+    sorted(&mut group);
+    let error = match solana_ledger::shred::merkle::recover(
+        group.iter().map(|s| (*s).clone()).collect(),
+        rs_cache,
+    ) {
+        Ok(recovered) => {
+            return RecoverOutcome::Recovered {
+                recovered: recovered.filter_map(Result::ok).collect(),
+                version_data: if single_version {
+                    Vec::new()
+                } else {
+                    data_shreds(&group)
+                },
+                regrouped: !single_version,
+            }
+        }
+        Err(e) => e,
+    };
+
+    // Same signature, still no match: drop shreds whose proof leads elsewhere.
+    let roots: Vec<Option<BlockHash>> = group
+        .iter()
+        .map(|s| solana_ledger::shred::layout::get_merkle_root(s.payload().as_ref()))
+        .collect();
+    let majority = roots
+        .iter()
+        .flatten()
+        .counts()
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(root, _)| *root);
+    let consistent: Vec<&Shred> = group
+        .iter()
+        .zip(&roots)
+        .filter(|(_, root)| root.is_some() && root.as_ref() == majority.as_ref())
+        .map(|(s, _)| *s)
+        .collect();
+    let bad_shreds = group.len() - consistent.len();
+    if bad_shreds == 0 || !has_enough_to_recover(&consistent) {
+        metrics
+            .fec_recovery_bad_shred_count
+            .fetch_add(bad_shreds as u64, Ordering::Relaxed);
+        return RecoverOutcome::Failed {
+            error,
+            versions: versions(),
+            bad_shreds,
+        };
+    }
+    metrics
+        .fec_recovery_bad_shred_count
+        .fetch_add(bad_shreds as u64, Ordering::Relaxed);
+    match solana_ledger::shred::merkle::recover(
+        consistent.iter().map(|s| (*s).clone()).collect(),
+        rs_cache,
+    ) {
+        Ok(recovered) => RecoverOutcome::Recovered {
+            recovered: recovered.filter_map(Result::ok).collect(),
+            version_data: data_shreds(&consistent),
+            regrouped: true,
+        },
+        Err(error) => RecoverOutcome::Failed {
+            error,
+            versions: versions(),
+            bad_shreds,
+        },
+    }
+}
+
+fn data_shreds(group: &[&Shred]) -> Vec<Shred> {
+    group
+        .iter()
+        .filter(|s| s.shred_type() == ShredType::Data)
+        .map(|s| (*s).clone())
+        .collect()
+}
+
+/// At least as many shreds as the set has data shreds, and a coding shred (whose header
+/// `merkle::recover` reads the set's shape from).
+fn has_enough_to_recover(group: &[&Shred]) -> bool {
+    group
+        .iter()
+        .find_map(|s| match s {
+            Shred::ShredCode(code) => Some(usize::from(code.coding_header.num_data_shreds)),
+            Shred::ShredData(_) => None,
+        })
+        .is_some_and(|num_data| group.len() >= num_data)
+}
+
+/// Put a recovered data shred in place of the one the tracker holds for its index.
+fn replace_data_shred(shred: &Shred, state_tracker: &mut ShredsStateTracker) {
+    let Shred::ShredData(data) = shred else {
+        return;
+    };
+    let index = shred.index() as usize;
+    state_tracker.data_shreds[index] = Some(shred.clone());
+    state_tracker.data_status[index] = if data.data_complete() || data.last_in_slot() {
+        ShredStatus::DataComplete
+    } else {
+        ShredStatus::NotDataComplete
+    };
+}
+
+/// At most one log line per second per call site.
+fn warn_allowed(last_secs: &AtomicU64) -> bool {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    last_secs.swap(now_secs, Ordering::Relaxed) != now_secs
+}
+
 /// Structural check of a batch whose start was proven (the shred before it is
 /// DATA_COMPLETE, or it starts the slot), run by the reconstruct thread *after* the batch
 /// was published so the known-start path pays nothing for it. Such a batch is published
@@ -502,11 +815,7 @@ pub fn observe_known_start_batch(
                 .known_start_invalid_count
                 .fetch_add(1, Ordering::Relaxed);
             static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if LAST_WARN_SECS.swap(now_secs, Ordering::Relaxed) != now_secs {
+            if warn_allowed(&LAST_WARN_SECS) {
                 warn!(
                     "slot {slot}: published batch {start_index}..={end_index} ({} bytes) has a proven start but does not parse: {e}; first bytes {:02x?}",
                     payload.len(),
@@ -1138,6 +1447,64 @@ mod tests {
         );
     }
 
+    /// The captured mainnet shreds fed in arrival order, in small packet batches as the
+    /// reconstruct thread sees them (not as one batch): recovery then runs on most sets as
+    /// soon as they hold 32 shreds. Every batch is still emitted exactly once and decodes,
+    /// with and without a third of the packets lost, and no recovery attempt fails.
+    #[test]
+    fn chunked_replay_of_captured_shreds_loses_nothing() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let packets = {
+            let mut f = std::fs::File::open("../bins/serialized_shreds.bin").unwrap();
+            let mut buffer = Vec::new();
+            f.read_to_end(&mut buffer).unwrap();
+            Packets::try_from_slice(&buffer).unwrap()
+        };
+        for drop_every in [0usize, 3] {
+            for chunk in [1usize, 64] {
+                let metrics = ShredMetrics::default();
+                let rs_cache = ReedSolomonCache::default();
+                let mut all_shreds = ahash::HashMap::default();
+                let (mut scratch, mut entries, mut ranges) = (vec![], vec![], vec![]);
+                let mut highest_slot_seen = 0;
+                let mut emitted = 0usize;
+                let kept: Vec<&Vec<u8>> = packets
+                    .packets
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| drop_every == 0 || (i + 1) % drop_every != 0)
+                    .map(|(_, p)| p)
+                    .collect();
+                for c in kept.chunks(chunk) {
+                    crate::deshred::reconstruct_shred_payloads(
+                        c.iter().map(|p| p.as_slice()),
+                        &mut all_shreds,
+                        &mut scratch,
+                        &mut entries,
+                        &mut ranges,
+                        &mut highest_slot_seen,
+                        &rs_cache,
+                        &metrics,
+                    );
+                    for (_, bytes) in entries.drain(..) {
+                        emitted += 1;
+                        bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&bytes).unwrap();
+                    }
+                    ranges.clear();
+                }
+                let case = format!("drop_every={drop_every} chunk={chunk}");
+                assert_eq!(emitted, 609, "{case}");
+                assert_eq!(metrics.fec_recovery_failed_count.load(Relaxed), 0, "{case}");
+                assert_eq!(
+                    metrics.mixed_version_batch_held_count.load(Relaxed),
+                    0,
+                    "{case}"
+                );
+                assert!(metrics.recovered_count.load(Relaxed) > 0, "{case}");
+            }
+        }
+    }
+
     /// Helper function to compare all shred output
     #[allow(unused)]
     fn debug_to_disk(
@@ -1639,7 +2006,12 @@ pub(crate) mod validated_start_tests {
             }
         }
 
-        fn shred(&self, payload: &[u8], next_data: u32, next_code: u32) -> Vec<merkle::Shred> {
+        pub(crate) fn shred(
+            &self,
+            payload: &[u8],
+            next_data: u32,
+            next_code: u32,
+        ) -> Vec<merkle::Shred> {
             merkle::make_shreds_from_data(
                 &self.pool,
                 &self.keypair,
@@ -2000,6 +2372,181 @@ pub(crate) mod validated_start_tests {
         );
         assert_eq!(out, vec![(s.a.clone(), 32, 95, false)]);
         assert_eq!(count(&proxy.metrics.recovered_batch_count), 1);
+    }
+
+    /// Z (set 0), batch A (sets 32 and 64) and B (set 96) from one leader, plus a second
+    /// signed version of A's sets from another key with different contents: the shape of
+    /// an equivocating or re-signed stream merged into the same (slot, fec_set_index).
+    struct TwoVersions {
+        main: Slot3,
+        other_a: Vec<u8>,
+        other: Vec<merkle::Shred>,
+    }
+
+    fn two_versions_of_a() -> TwoVersions {
+        let main = three_batches(&[]);
+        let other_leader = Leader::new();
+        let set = other_leader.fec_set_payload_bytes();
+        let other_a = payload_of_len(2 * set, &[decode(V1_SMALL_B64)]);
+        assert_ne!(other_a, main.a);
+        let other = other_leader.shred(&other_a, 32, 32);
+        TwoVersions {
+            main,
+            other_a,
+            other,
+        }
+    }
+
+    fn in_set(x: &merkle::Shred, fec: u32, data: bool) -> bool {
+        x.fec_set_index() == fec && is_data(x) == data
+    }
+
+    /// Coding shreds of set `fec`, ordered by position.
+    fn coding(shreds: &[merkle::Shred], fec: u32) -> Vec<&merkle::Shred> {
+        let mut c: Vec<_> = shreds.iter().filter(|x| in_set(x, fec, false)).collect();
+        c.sort_by_key(|x| x.index());
+        c
+    }
+
+    fn feed_one_by_one(proxy: &mut Proxy, shreds: &[&merkle::Shred]) -> Vec<Emitted> {
+        let mut out = vec![];
+        for s in shreds {
+            out.extend(proxy.feed([*s]));
+        }
+        out
+    }
+
+    #[test]
+    fn mixed_version_set_recovers_from_its_own_version() {
+        // The FRA log line: 27 data + 19 coding shreds, "Invalid Merkle root". A's first
+        // set lost data 59..=63; it holds 16 of A's coding shreds and 3 of the other
+        // version's, whose last position made the whole set unrecoverable.
+        let v = two_versions_of_a();
+        let s = &v.main;
+        let mut feed: Vec<&merkle::Shred> = coding(&v.other, 32).into_iter().skip(29).collect();
+        feed.extend(
+            s.shreds
+                .iter()
+                .filter(|x| x.fec_set_index() != 32 && x.fec_set_index() != 96),
+        );
+        feed.extend(
+            s.shreds
+                .iter()
+                .filter(|x| in_set(x, 32, true) && x.index() <= 58),
+        );
+        feed.extend(coding(&s.shreds, 32).into_iter().take(16));
+        let mut proxy = Proxy::new();
+        let out = feed_one_by_one(&mut proxy, &feed);
+        assert_eq!(
+            out,
+            vec![(s.z.clone(), 0, 31, false), (s.a.clone(), 32, 95, false)]
+        );
+        let m = proxy.metrics.clone();
+        assert_eq!(count(&m.fec_recovery_failed_count), 0);
+        assert_eq!(count(&m.fec_recovery_regrouped_count), 1);
+        assert!(count(&m.fec_recovery_mixed_version_count) >= 1);
+    }
+
+    #[test]
+    fn other_version_data_already_accepted_is_replaced_not_mixed_in() {
+        // The other version's data shreds 59..=63 arrive first and take those indexes; A's
+        // copies of them are then rejected as duplicates. Recovery from A's own shreds
+        // must replace them, or the emitted batch would splice two versions together.
+        let v = two_versions_of_a();
+        let s = &v.main;
+        let mut feed: Vec<&merkle::Shred> = v
+            .other
+            .iter()
+            .filter(|x| in_set(x, 32, true) && x.index() >= 59)
+            .collect();
+        feed.extend(s.shreds.iter().filter(|x| x.fec_set_index() != 96));
+        let mut proxy = Proxy::new();
+        let out = feed_one_by_one(&mut proxy, &feed);
+        assert_eq!(
+            out,
+            vec![(s.z.clone(), 0, 31, false), (s.a.clone(), 32, 95, false)]
+        );
+        assert_ne!(s.a, v.other_a);
+        assert_eq!(count(&proxy.metrics.fec_recovery_failed_count), 0);
+        assert_eq!(count(&proxy.metrics.known_start_invalid_count), 0);
+    }
+
+    /// A copy of a shred whose bytes inside the erasure shard (here the chained Merkle
+    /// root) differ from what its proof commits to. `ComparableShred` ignores those bytes,
+    /// so whichever copy arrives first is the one kept.
+    fn corrupted(x: &merkle::Shred) -> merkle::Shred {
+        let mut bytes = x.payload().as_ref().to_vec();
+        let at = if is_data(x) { 1060 } else { 300 };
+        bytes[at] ^= 0x5a;
+        let corrupted = merkle::Shred::from_payload(bytes).unwrap();
+        assert_ne!(
+            layout::get_merkle_root(corrupted.payload().as_ref()),
+            layout::get_merkle_root(x.payload().as_ref())
+        );
+        corrupted
+    }
+
+    #[test]
+    fn corrupted_copy_is_dropped_and_the_set_recovers() {
+        let s = three_batches(&[]);
+        let bad = corrupted(
+            s.shreds
+                .iter()
+                .find(|x| in_set(x, 32, true) && x.index() == 40)
+                .unwrap(),
+        );
+        // A's first set: data 32..=58 with a corrupted 40, then coding shreds.
+        let mut feed: Vec<&merkle::Shred> =
+            s.shreds.iter().filter(|x| x.fec_set_index() == 0).collect();
+        feed.push(&bad);
+        feed.extend(
+            s.shreds
+                .iter()
+                .filter(|x| in_set(x, 32, true) && x.index() <= 58 && x.index() != 40),
+        );
+        feed.extend(coding(&s.shreds, 32));
+        feed.extend(s.shreds.iter().filter(|x| x.fec_set_index() == 64));
+        let mut proxy = Proxy::new();
+        let out = feed_one_by_one(&mut proxy, &feed);
+        assert_eq!(
+            out,
+            vec![(s.z.clone(), 0, 31, false), (s.a.clone(), 32, 95, false)]
+        );
+        let m = proxy.metrics.clone();
+        // At 32 shreds the good copies alone are 31, one short: that attempt fails and
+        // the next is 4 shreds later. Both attempts see the one bad copy.
+        assert_eq!(count(&m.fec_recovery_failed_count), 1);
+        assert_eq!(count(&m.fec_recovery_bad_shred_count), 2);
+        assert_eq!(count(&m.fec_recovery_regrouped_count), 1);
+    }
+
+    #[test]
+    fn unrecoverable_set_is_not_retried_on_every_shred() {
+        let s = three_batches(&[]);
+        let set32_coding = coding(&s.shreds, 32);
+        let bad: Vec<merkle::Shred> = set32_coding[..20].iter().map(|x| corrupted(x)).collect();
+        // 27 good data shreds, then 20 corrupted coding shreds one by one: never 32
+        // consistent shreds. Then the good coding shreds: consistent from the 5th.
+        let mut feed: Vec<&merkle::Shred> =
+            s.shreds.iter().filter(|x| x.fec_set_index() == 0).collect();
+        feed.extend(
+            s.shreds
+                .iter()
+                .filter(|x| in_set(x, 32, true) && x.index() <= 58),
+        );
+        feed.extend(bad.iter());
+        feed.extend(set32_coding[20..].iter().copied());
+        feed.extend(s.shreds.iter().filter(|x| x.fec_set_index() == 64));
+        let mut proxy = Proxy::new();
+        let out = feed_one_by_one(&mut proxy, &feed);
+        assert_eq!(
+            out,
+            vec![(s.z.clone(), 0, 31, false), (s.a.clone(), 32, 95, false)]
+        );
+        // Attempts at 32, 36, ... shreds instead of at every one of 32..=51.
+        let failures = count(&proxy.metrics.fec_recovery_failed_count);
+        assert!((1..=6).contains(&failures), "{failures} failed attempts");
+        assert!(count(&proxy.metrics.fec_recovery_retry_skipped_count) >= 12);
     }
 
     #[test]
