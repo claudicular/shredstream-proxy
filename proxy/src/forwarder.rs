@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -32,11 +31,7 @@ use solana_streamer::{
 };
 use tokio::sync::broadcast::Sender;
 
-use crate::{
-    deshred,
-    deshred::{ComparableShred, ShredsStateTracker},
-    resolve_hostname_port, ShredstreamProxyError,
-};
+use crate::{deshred, resolve_hostname_port, ShredstreamProxyError};
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
 pub const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
@@ -87,7 +82,7 @@ pub fn start_forwarder_threads(
     // to `SourceId::DoubleZero` (by ingress) rather than by packet source IP.
     let n_unicast_sockets = sockets.len();
 
-    let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded(1_024);
+    let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded::<PacketBatch>(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
 
     if should_reconstruct_shreds {
@@ -97,94 +92,18 @@ pub fn start_forwarder_threads(
         let hdl = std::thread::Builder::new()
             .name("shred_reconstructor".to_string())
             .spawn(move || {
-                // Create shared memory ring buffer if configured
-                let mut shmem_ring = shmem_ring_path.as_ref().map(|path| {
-                    crate::shmem_ring::ShmemRingProducer::create(path)
-                        .expect("Failed to create shmem ring buffer")
-                });
-
-                let mut all_shreds = ahash::HashMap::<
-                    Slot,
-                    (
-                        ahash::HashMap<u32, HashSet<ComparableShred>>,
-                        ShredsStateTracker,
-                    ),
-                >::default();
-                let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
-                let mut deshredded_entries = Vec::<(Slot, Vec<u8>)>::new();
-                // Parallel to deshredded_entries: composing data-shred index range +
-                // unknown_start, for pipeline-latency attribution.
-                let mut entry_ranges = Vec::<(u32, u32, bool)>::new();
-                let mut highest_slot_seen: Slot = 0;
-                let rs_cache = ReedSolomonCache::default();
-
+                let mut reconstructor = Reconstructor::new(
+                    shmem_ring_path.as_deref(),
+                    entry_sender,
+                    pipeline_handle,
+                    metrics,
+                );
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(pkt_batch) => {
-                            deshred::reconstruct_shreds(
-                                pkt_batch,
-                                &mut all_shreds,
-                                &mut slot_fec_indexes_to_iterate,
-                                &mut deshredded_entries,
-                                &mut entry_ranges,
-                                &mut highest_slot_seen,
-                                &rs_cache,
-                                &metrics,
-                            );
-
-                            for ((slot, entries_bytes), &(start_index, end_index, unknown_start)) in
-                                deshredded_entries.iter().zip(entry_ranges.iter())
-                            {
-                                // Shmem write FIRST (lowest latency path) — unchanged.
-                                if let Some(ref mut ring) = shmem_ring {
-                                    ring.publish(*slot, entries_bytes);
-                                }
-
-                                // Pipeline latency: AFTER the shmem write (so it never
-                                // delays consumer visibility), capture the realtime
-                                // publish instant and hand a tiny event to the
-                                // aggregator. Non-blocking (drop-on-full); a single
-                                // Option branch when disabled.
-                                if let Some(ph) = pipeline_handle.as_ref() {
-                                    let publish_ts_ns = SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_nanos() as i64)
-                                        .unwrap_or(0);
-                                    ph.record(crate::benchmark::aggregator::PublishEvent {
-                                        slot: *slot,
-                                        start_index,
-                                        end_index,
-                                        unknown_start,
-                                        publish_ts_ns,
-                                    });
-                                }
-                            }
-
-                            // Every batch of this packet batch is in the ring before any
-                            // of the work below runs.
-                            for ((slot, entries_bytes), (start_index, end_index, unknown_start)) in
-                                deshredded_entries.drain(..).zip(entry_ranges.drain(..))
-                            {
-                                // Proven-start batches were published unchecked; walk
-                                // them now, off the publish path, for metrics and to make
-                                // an unknown wire format loud. Guessed starts were
-                                // validated before they were emitted.
-                                if !unknown_start {
-                                    deshred::observe_known_start_batch(
-                                        slot,
-                                        start_index,
-                                        end_index,
-                                        &entries_bytes,
-                                        &metrics,
-                                    );
-                                }
-
-                                // Then gRPC broadcast (existing path).
-                                let _ = entry_sender.send(PbEntry {
-                                    slot,
-                                    entries: entries_bytes,
-                                });
-                            }
+                            reconstructor
+                                .ingest_and_publish(pkt_batch.iter().filter_map(|p| p.data(..)));
+                            reconstructor.finish();
                         }
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {} // do nothing
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -305,6 +224,121 @@ pub fn start_forwarder_threads(
             vec![listen_thread, send_thread]
         })
         .collect::<Vec<JoinHandle<()>>>()
+}
+
+/// Deshred state plus every output of reconstructed entries (shmem ring, pipeline-latency
+/// events, gRPC broadcast). Owned by whichever thread runs reconstruction: the
+/// `shred_reconstructor` thread, or the lean ingest thread (`lean_ingest.rs`).
+pub(crate) struct Reconstructor {
+    shmem_ring: Option<crate::shmem_ring::ShmemRingProducer>,
+    all_shreds: deshred::SlotShreds,
+    slot_fec_indexes_to_iterate: Vec<(Slot, u32)>,
+    deshredded_entries: Vec<(Slot, Vec<u8>)>,
+    // Parallel to deshredded_entries: composing data-shred index range +
+    // unknown_start, for pipeline-latency attribution.
+    entry_ranges: Vec<(u32, u32, bool)>,
+    highest_slot_seen: Slot,
+    rs_cache: ReedSolomonCache,
+    entry_sender: Arc<Sender<PbEntry>>,
+    pipeline_handle: Option<crate::benchmark::PipelineLatencyHandle>,
+    metrics: Arc<ShredMetrics>,
+}
+
+impl Reconstructor {
+    /// Creates (truncates) the shmem ring if configured; panics if that fails.
+    pub(crate) fn new(
+        shmem_ring_path: Option<&std::path::Path>,
+        entry_sender: Arc<Sender<PbEntry>>,
+        pipeline_handle: Option<crate::benchmark::PipelineLatencyHandle>,
+        metrics: Arc<ShredMetrics>,
+    ) -> Self {
+        Self {
+            shmem_ring: shmem_ring_path.map(|path| {
+                crate::shmem_ring::ShmemRingProducer::create(path)
+                    .expect("Failed to create shmem ring buffer")
+            }),
+            all_shreds: deshred::SlotShreds::default(),
+            slot_fec_indexes_to_iterate: Vec::new(),
+            deshredded_entries: Vec::new(),
+            entry_ranges: Vec::new(),
+            highest_slot_seen: 0,
+            rs_cache: ReedSolomonCache::default(),
+            entry_sender,
+            pipeline_handle,
+            metrics,
+        }
+    }
+
+    /// Latency-critical half: deshred `payloads` and put every completed batch in the shmem
+    /// ring. Call [`Self::finish`] afterwards.
+    pub(crate) fn ingest_and_publish<'a>(&mut self, payloads: impl IntoIterator<Item = &'a [u8]>) {
+        deshred::reconstruct_shred_payloads(
+            payloads,
+            &mut self.all_shreds,
+            &mut self.slot_fec_indexes_to_iterate,
+            &mut self.deshredded_entries,
+            &mut self.entry_ranges,
+            &mut self.highest_slot_seen,
+            &self.rs_cache,
+            &self.metrics,
+        );
+
+        for ((slot, entries_bytes), &(start_index, end_index, unknown_start)) in
+            self.deshredded_entries.iter().zip(self.entry_ranges.iter())
+        {
+            // Shmem write FIRST (lowest latency path) — unchanged.
+            if let Some(ring) = self.shmem_ring.as_mut() {
+                ring.publish(*slot, entries_bytes);
+            }
+
+            // Pipeline latency: AFTER the shmem write (so it never
+            // delays consumer visibility), capture the realtime
+            // publish instant and hand a tiny event to the
+            // aggregator. Non-blocking (drop-on-full); a single
+            // Option branch when disabled.
+            if let Some(ph) = self.pipeline_handle.as_ref() {
+                let publish_ts_ns = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+                ph.record(crate::benchmark::aggregator::PublishEvent {
+                    slot: *slot,
+                    start_index,
+                    end_index,
+                    unknown_start,
+                    publish_ts_ns,
+                });
+            }
+        }
+    }
+
+    /// Off-path half, run once every batch of the packet batch is in the ring.
+    pub(crate) fn finish(&mut self) {
+        for ((slot, entries_bytes), (start_index, end_index, unknown_start)) in self
+            .deshredded_entries
+            .drain(..)
+            .zip(self.entry_ranges.drain(..))
+        {
+            // Proven-start batches were published unchecked; walk them now, off the
+            // publish path, for metrics and to make an unknown wire format loud.
+            // Guessed starts were validated before they were emitted.
+            if !unknown_start {
+                deshred::observe_known_start_batch(
+                    slot,
+                    start_index,
+                    end_index,
+                    &entries_bytes,
+                    &self.metrics,
+                );
+            }
+
+            // Then gRPC broadcast (existing path).
+            let _ = self.entry_sender.send(PbEntry {
+                slot,
+                entries: entries_bytes,
+            });
+        }
+    }
 }
 
 /// Broadcasts the same packet to multiple recipients, parses it into a Shred if possible,

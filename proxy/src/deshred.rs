@@ -17,7 +17,6 @@ use solana_ledger::{
     },
 };
 use solana_metrics::datapoint_warn;
-use solana_perf::packet::PacketBatch;
 use solana_sdk::clock::{Slot, MAX_PROCESSING_AGE};
 
 use crate::{
@@ -91,6 +90,44 @@ fn take_rejected_guesses(bits: &mut [u64], start: usize, end: usize) -> bool {
     any
 }
 
+/// [`reconstruct_shred_payloads`] over a `PacketBatch`.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_shreds(
+    packet_batch: solana_perf::packet::PacketBatch,
+    all_shreds: &mut SlotShreds,
+    slot_fec_indexes_to_iterate: &mut Vec<(Slot, u32)>,
+    deshredded_entries: &mut Vec<(Slot, Vec<u8>)>,
+    // Parallel to `deshredded_entries` (same order/length): the inclusive composing
+    // data-shred index range `(start, end)` and whether the left boundary was guessed
+    // (`unknown_start`), for pipeline-latency attribution. Filled unconditionally
+    // (negligible); the reconstruct thread ignores it when pipeline latency is off.
+    entry_ranges: &mut Vec<(u32, u32, bool)>,
+    highest_slot_seen: &mut Slot,
+    rs_cache: &ReedSolomonCache,
+    metrics: &ShredMetrics,
+) -> usize {
+    reconstruct_shred_payloads(
+        packet_batch.iter().filter_map(|p| p.data(..)),
+        all_shreds,
+        slot_fec_indexes_to_iterate,
+        deshredded_entries,
+        entry_ranges,
+        highest_slot_seen,
+        rs_cache,
+        metrics,
+    )
+}
+
+/// Per-slot shred state: FEC-set shred sets plus the data-shred tracker.
+pub type SlotShreds = ahash::HashMap<
+    Slot,
+    (
+        ahash::HashMap<u32 /* fec_set_index */, HashSet<ComparableShred>>,
+        ShredsStateTracker,
+    ),
+>;
+
 /// Returns the number of shreds reconstructed
 /// Updates all_shreds with current state, and deshredded_entries with returned values
 /// receive shreds per FEC set, attempting to recover the other shreds in the fec set so you do not have to wait until all data shreds have arrived.
@@ -110,22 +147,15 @@ fn take_rejected_guesses(bits: &mut [u64], start: usize, end: usize) -> bool {
 ///
 /// `slot_fec_indexes_to_iterate` is scratch space; after recovery it also holds the index
 /// after every newly known DATA_COMPLETE shred, whose batch just gained a proven start.
+///
+/// Takes raw shred payloads (one received datagram each), so a caller that owns its
+/// receive buffers needs no `PacketBatch`.
 #[allow(clippy::too_many_arguments)]
-pub fn reconstruct_shreds(
-    packet_batch: PacketBatch,
-    all_shreds: &mut ahash::HashMap<
-        Slot,
-        (
-            ahash::HashMap<u32 /* fec_set_index */, HashSet<ComparableShred>>,
-            ShredsStateTracker,
-        ),
-    >,
+pub fn reconstruct_shred_payloads<'a>(
+    payloads: impl IntoIterator<Item = &'a [u8]>,
+    all_shreds: &mut SlotShreds,
     slot_fec_indexes_to_iterate: &mut Vec<(Slot, u32)>,
     deshredded_entries: &mut Vec<(Slot, Vec<u8>)>,
-    // Parallel to `deshredded_entries` (same order/length): the inclusive composing
-    // data-shred index range `(start, end)` and whether the left boundary was guessed
-    // (`unknown_start`), for pipeline-latency attribution. Filled unconditionally
-    // (negligible); the reconstruct thread ignores it when pipeline latency is off.
     entry_ranges: &mut Vec<(u32, u32, bool)>,
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
@@ -138,7 +168,7 @@ pub fn reconstruct_shreds(
     // became proven. Usually empty or one element per packet batch.
     let mut proven_starts = Vec::<(Slot, u32)>::new();
     // ingest all packets
-    for packet in packet_batch.iter().filter_map(|p| p.data(..)) {
+    for packet in payloads {
         match solana_ledger::shred::Shred::new_from_serialized_shred(packet.to_vec())
             .and_then(Shred::try_from)
         {
