@@ -43,6 +43,7 @@ mod lean_ingest;
 mod multicast_config;
 mod server;
 pub mod shmem_ring;
+pub mod shmem_ring_v2;
 mod stream_stats;
 mod token_authenticator;
 

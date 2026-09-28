@@ -900,10 +900,11 @@ fn finish_stream(
         .fetch_add(remaining, Ordering::Relaxed);
     m.stream_txs_completion_count
         .fetch_add(remaining_txs, Ordering::Relaxed);
-    if let Some(record) = record {
-        out.deshredded_entries.push((out.slot, record));
-        out.entry_ranges.push((start, end, false));
-    }
+    // With nothing left to publish, an empty payload still marks the batch complete for
+    // position-aware consumers (ring v2). Every other consumer skips empty payloads.
+    out.deshredded_entries
+        .push((out.slot, record.unwrap_or_default()));
+    out.entry_ranges.push((start, end, false));
     let split = !stream.early.is_empty();
     if split {
         m.stream_batches_split_count.fetch_add(1, Ordering::Relaxed);
@@ -948,6 +949,39 @@ enum RecoverOutcome {
         versions: String,
         bad_shreds: usize,
     },
+}
+
+/// Position facts of a published record, for ring v2: the slot's parent, whether shred
+/// `end` completes its batch (DATA_COMPLETE), and whether it is the slot's last shred.
+pub(crate) fn record_position(
+    all_shreds: &SlotShreds,
+    slot: Slot,
+    start: u32,
+    end: u32,
+) -> (Option<Slot>, bool, bool) {
+    let Some((_, tracker)) = all_shreds.get(&slot) else {
+        return (None, false, false);
+    };
+    // Data-shred header: parent_offset u16 at byte 83, flags u8 at byte 85.
+    let parent = tracker
+        .data_shreds
+        .get(start as usize)
+        .and_then(|s| s.as_ref())
+        .and_then(|s| {
+            let payload: &[u8] = s.payload().as_ref();
+            let offset = u16::from_le_bytes(payload.get(83..85)?.try_into().ok()?);
+            slot.checked_sub(u64::from(offset))
+        });
+    let is_final = tracker.data_status.get(end as usize) == Some(&ShredStatus::DataComplete);
+    let last_in_slot = tracker
+        .data_shreds
+        .get(end as usize)
+        .and_then(|s| s.as_ref())
+        .is_some_and(|s| {
+            solana_ledger::shred::layout::get_flags(s.payload().as_ref())
+                .is_ok_and(|f| f.contains(solana_ledger::shred::ShredFlags::LAST_SHRED_IN_SLOT))
+        });
+    (parent, is_final, last_in_slot)
 }
 
 /// Every shred of the set carries the same leader signature.
@@ -2539,6 +2573,9 @@ pub(crate) mod validated_start_tests {
             entries
                 .into_iter()
                 .zip(ranges)
+                // Empty payloads are ring-v2 batch-complete markers; every other consumer
+                // (v1 ring, gRPC, the known-start walk) skips them, and so does this harness.
+                .filter(|((_, bytes), _)| !bytes.is_empty())
                 .map(|((slot, bytes), (start, end, unknown_start))| {
                     assert_eq!(slot, SLOT);
                     if !unknown_start {

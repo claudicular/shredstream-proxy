@@ -265,6 +265,9 @@ pub fn start_forwarder_threads(
 /// `shred_reconstructor` thread, or the lean ingest thread (`lean_ingest.rs`).
 pub(crate) struct Reconstructor {
     shmem_ring: Option<crate::shmem_ring::ShmemRingProducer>,
+    /// Ring v2 (positions for agave's fast lane): enabled by `SHMEM_RING_V2_PATH`.
+    shmem_ring_v2: Option<crate::shmem_ring_v2::ShmemRingV2Producer>,
+    batch_offsets: crate::shmem_ring_v2::BatchOffsets,
     all_shreds: deshred::SlotShreds,
     slot_fec_indexes_to_iterate: Vec<(Slot, u32)>,
     deshredded_entries: Vec<(Slot, Vec<u8>)>,
@@ -295,6 +298,14 @@ impl Reconstructor {
                 crate::shmem_ring::ShmemRingProducer::create(path)
                     .expect("Failed to create shmem ring buffer")
             }),
+            shmem_ring_v2: std::env::var_os("SHMEM_RING_V2_PATH").map(|path| {
+                let path = std::path::PathBuf::from(path);
+                let ring = crate::shmem_ring_v2::ShmemRingV2Producer::create(&path)
+                    .expect("Failed to create shmem ring v2");
+                info!("Shmem ring v2 (positions) at {}", path.display());
+                ring
+            }),
+            batch_offsets: crate::shmem_ring_v2::BatchOffsets::default(),
             all_shreds: deshred::SlotShreds::default(),
             slot_fec_indexes_to_iterate: Vec::new(),
             deshredded_entries: Vec::new(),
@@ -326,9 +337,56 @@ impl Reconstructor {
         for ((slot, entries_bytes), &(start_index, end_index, unknown_start)) in
             self.deshredded_entries.iter().zip(self.entry_ranges.iter())
         {
-            // Shmem write FIRST (lowest latency path) — unchanged.
+            // Shmem write FIRST (lowest latency path) — unchanged. An empty payload is a
+            // batch-complete marker for ring v2 only.
             if let Some(ring) = self.shmem_ring.as_mut() {
-                ring.publish(*slot, entries_bytes);
+                if !entries_bytes.is_empty() {
+                    ring.publish(*slot, entries_bytes);
+                }
+            }
+            if let Some(ring) = self.shmem_ring_v2.as_mut() {
+                let (parent, is_final, last_in_slot) = deshred::record_position(
+                    &self.all_shreds,
+                    *slot,
+                    start_index,
+                    end_index,
+                );
+                let entry_count = entries_bytes
+                    .get(..8)
+                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()) as u32)
+                    .unwrap_or(0);
+                let entry_offset =
+                    self.batch_offsets
+                        .take(*slot, start_index, entry_count, is_final);
+                let mut flags = 0;
+                if is_final {
+                    flags |= crate::shmem_ring_v2::FLAG_FINAL;
+                }
+                if last_in_slot {
+                    flags |= crate::shmem_ring_v2::FLAG_LAST_IN_SLOT;
+                }
+                if unknown_start {
+                    flags |= crate::shmem_ring_v2::FLAG_GUESSED_START;
+                }
+                ring.publish(
+                    &crate::shmem_ring_v2::RecordMeta {
+                        slot: *slot,
+                        parent_slot: parent.unwrap_or(u64::MAX),
+                        batch_start: start_index,
+                        batch_end: end_index,
+                        entry_offset,
+                        entry_count,
+                        flags,
+                        t_publish_ns: SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0),
+                    },
+                    entries_bytes,
+                );
+            }
+            if entries_bytes.is_empty() {
+                continue;
             }
 
             // Pipeline latency: AFTER the shmem write (so it never
@@ -354,11 +412,19 @@ impl Reconstructor {
 
     /// Off-path half, run once every batch of the packet batch is in the ring.
     pub(crate) fn finish(&mut self) {
+        if self.shmem_ring_v2.is_some() {
+            self.batch_offsets
+                .prune(self.highest_slot_seen.saturating_sub(64));
+        }
         for ((slot, entries_bytes), (start_index, end_index, unknown_start)) in self
             .deshredded_entries
             .drain(..)
             .zip(self.entry_ranges.drain(..))
         {
+            if entries_bytes.is_empty() {
+                // Ring v2 batch-complete marker: nothing to walk or broadcast.
+                continue;
+            }
             // Proven-start batches were published unchecked; walk them now, off the
             // publish path, for metrics and to make an unknown wire format loud.
             // Guessed starts were validated before they were emitted.
