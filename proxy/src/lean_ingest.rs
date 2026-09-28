@@ -52,6 +52,7 @@ use crate::{
         BenchmarkHandle, PipelineLatencyHandle,
     },
     forwarder::{recv_from_channel_and_send_multiple_dest, Reconstructor, ShredMetrics},
+    stream_stats::StreamStatsHandle,
 };
 
 /// Receive calls (not packets) the forwarding thread may lag behind before copies are
@@ -87,6 +88,7 @@ pub fn start_lean_ingest_threads(
     bench_handle: Option<BenchmarkHandle>,
     bench_kernel_timestamps: bool,
     pipeline_handle: Option<PipelineLatencyHandle>,
+    stream_stats: Option<StreamStatsHandle>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
     for socket in &sockets {
@@ -136,6 +138,7 @@ pub fn start_lean_ingest_threads(
                     entry_sender,
                     pipeline_handle,
                     metrics.clone(),
+                    stream_stats,
                 )
             });
             let source_overrides = (0..sockets.len())
@@ -358,6 +361,17 @@ mod tests {
     /// order, reaches gRPC, and is forwarded to the destination exactly once.
     #[test]
     fn lean_ingest_publishes_batches_and_forwards_deduped_shreds() {
+        lean_ingest_end_to_end(false);
+    }
+
+    /// The same with --stream-entries: the ring and gRPC carry identical records whose
+    /// entries, joined per batch, are each batch's entries exactly once.
+    #[test]
+    fn lean_ingest_streams_entries_exactly_once() {
+        lean_ingest_end_to_end(true);
+    }
+
+    fn lean_ingest_end_to_end(stream: bool) {
         let mut leader = Leader::new();
         let set = leader.fec_set_payload_bytes();
         let payloads = [
@@ -389,6 +403,8 @@ mod tests {
         let mut grpc = entry_sender.subscribe();
         let metrics = Arc::new(ShredMetrics::new(true));
         let exit = Arc::new(AtomicBool::new(false));
+        let stats = stream
+            .then(|| crate::stream_stats::start(Duration::from_secs(3600), None, exit.clone()));
         let handles = start_lean_ingest_threads(
             LeanIngestConfig { core: None },
             vec![listen],
@@ -409,6 +425,7 @@ mod tests {
             None,
             false,
             None,
+            stats.as_ref().map(|(handle, _)| handle.clone()),
             exit.clone(),
         );
 
@@ -432,17 +449,34 @@ mod tests {
             }
         }
 
-        let mut published = vec![];
+        // Records until every batch's entries are in: (count, bytes) joined per record.
+        let total_entries: u64 = payloads
+            .iter()
+            .map(|p| u64::from_le_bytes(p[..8].try_into().unwrap()))
+            .sum();
+        let mut published: Vec<Vec<u8>> = vec![];
+        let mut entries_seen = 0u64;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while published.len() < payloads.len() && Instant::now() < deadline {
+        while entries_seen < total_entries && Instant::now() < deadline {
             match consumer.poll() {
-                PollResult::Entry(e) => published.push((e.slot, e.entries_bytes.to_vec())),
+                PollResult::Entry(e) => {
+                    assert_eq!(e.slot, SLOT);
+                    entries_seen += u64::from_le_bytes(e.entries_bytes[..8].try_into().unwrap());
+                    published.push(e.entries_bytes.to_vec());
+                }
                 PollResult::Empty => std::thread::yield_now(),
                 PollResult::Reset => panic!("ring reset"),
             }
         }
-        let expected: Vec<_> = payloads.iter().map(|p| (SLOT, p.clone())).collect();
-        assert_eq!(published, expected);
+        assert_eq!(entries_seen, total_entries);
+        if stream {
+            // Batches go out in order, so the joined entry bytes are all batches' entries.
+            let joined: Vec<u8> = published.iter().flat_map(|r| r[8..].to_vec()).collect();
+            let expected: Vec<u8> = payloads.iter().flat_map(|p| p[8..].to_vec()).collect();
+            assert_eq!(joined, expected);
+        } else {
+            assert_eq!(published, payloads.to_vec());
+        }
 
         let mut forwarded = vec![];
         let mut buf = [0u8; 2048];
@@ -457,14 +491,21 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        for payload in &payloads {
-            assert_eq!(&grpc.try_recv().unwrap().entries, payload);
+        for record in &published {
+            assert_eq!(&grpc.try_recv().unwrap().entries, record);
         }
+        assert!(grpc.try_recv().is_err());
         let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(load(&metrics.forward_queue_dropped), 0);
         assert_eq!(load(&metrics.received), 2 * shreds.len() as u64);
         assert_eq!(load(&metrics.known_start_invalid_count), 0);
-        assert_eq!(load(&metrics.batch_walk_count), 3);
+        assert_eq!(load(&metrics.batch_walk_count), published.len() as u64);
+        if stream {
+            assert_eq!(load(&metrics.stream_batches_count), 3);
+        }
+        if let Some((_, join)) = stats {
+            join.join().unwrap();
+        }
         let _ = std::fs::remove_file(&ring_path);
     }
 }

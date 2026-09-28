@@ -58,6 +58,10 @@ pub struct ShredsStateTracker {
     /// FEC set index -> number of shreds the set held when its last recovery attempt
     /// failed. The next attempt waits for `RECOVERY_RETRY_STEP` more shreds.
     failed_recovery_len: ahash::HashMap<u32, usize>,
+    /// `--stream-entries`: in-progress batches with a proven start, keyed by start index.
+    streams: ahash::HashMap<u32, EntryStream>,
+    /// Data shred index a stream needs next -> that stream's start.
+    stream_waiting: ahash::HashMap<u32, u32>,
 }
 impl Default for ShredsStateTracker {
     fn default() -> Self {
@@ -68,6 +72,8 @@ impl Default for ShredsStateTracker {
             already_deshredded: vec![false; MAX_DATA_SHREDS_PER_SLOT],
             rejected_guess_starts: vec![0; MAX_DATA_SHREDS_PER_SLOT.div_ceil(64)],
             failed_recovery_len: ahash::HashMap::default(),
+            streams: ahash::HashMap::default(),
+            stream_waiting: ahash::HashMap::default(),
         }
     }
 }
@@ -124,6 +130,7 @@ pub fn reconstruct_shreds(
         highest_slot_seen,
         rs_cache,
         metrics,
+        None,
     )
 }
 
@@ -158,6 +165,10 @@ pub type SlotShreds = ahash::HashMap<
 ///
 /// Takes raw shred payloads (one received datagram each), so a caller that owns its
 /// receive buffers needs no `PacketBatch`.
+///
+/// `stream`: `Some` turns on streaming emission (`--stream-entries`, see [`EntryStream`]):
+/// batches with a proven start are then emitted entry by entry as their data shreds arrive
+/// in order, and per-batch stream events for the stats thread are appended to it.
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_shred_payloads<'a>(
     payloads: impl IntoIterator<Item = &'a [u8]>,
@@ -168,13 +179,17 @@ pub fn reconstruct_shred_payloads<'a>(
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
+    stream: Option<&mut Vec<StreamEvent>>,
 ) -> usize {
     deshredded_entries.clear();
     entry_ranges.clear();
     slot_fec_indexes_to_iterate.clear();
+    let streaming = stream.is_some();
     // (slot, index after a newly known DATA_COMPLETE data shred): batches whose start just
     // became proven. Usually empty or one element per packet batch.
     let mut proven_starts = Vec::<(Slot, u32)>::new();
+    // Streaming only: data shred indexes that entered the tracker in this call.
+    let mut inserted_data = Vec::<(Slot, u32)>::new();
     // ingest all packets
     for packet in payloads {
         match solana_ledger::shred::Shred::new_from_serialized_shred(packet.to_vec())
@@ -216,10 +231,13 @@ pub fn reconstruct_shred_payloads<'a>(
                     }
                     continue;
                 };
-                if shred.shred_type() == ShredType::Data
-                    && state_tracker.data_status[index] == ShredStatus::DataComplete
-                {
-                    proven_starts.push((slot, index as u32 + 1));
+                if shred.shred_type() == ShredType::Data {
+                    if state_tracker.data_status[index] == ShredStatus::DataComplete {
+                        proven_starts.push((slot, index as u32 + 1));
+                    }
+                    if streaming {
+                        inserted_data.push((slot, index as u32));
+                    }
                 }
 
                 all_shreds
@@ -328,6 +346,9 @@ pub fn reconstruct_shred_payloads<'a>(
                     })
                 {
                     replace_data_shred(shred, state_tracker);
+                    if streaming {
+                        inserted_data.push((*slot, index as u32));
+                    }
                 }
             }
         }
@@ -351,10 +372,13 @@ pub fn reconstruct_shred_payloads<'a>(
             if !installed {
                 continue; // already seen before in state tracker
             }
-            if shred.shred_type() == ShredType::Data
-                && state_tracker.data_status[index] == ShredStatus::DataComplete
-            {
-                proven_starts.push((*slot, index as u32 + 1));
+            if shred.shred_type() == ShredType::Data {
+                if state_tracker.data_status[index] == ShredStatus::DataComplete {
+                    proven_starts.push((*slot, index as u32 + 1));
+                }
+                if streaming {
+                    inserted_data.push((*slot, index as u32));
+                }
             }
             // shreds.insert(ComparableShred(shred)); // optional since all data shreds are in state_tracker
             total_recovered_count += 1;
@@ -377,6 +401,25 @@ pub fn reconstruct_shred_payloads<'a>(
         slot_fec_indexes_to_iterate.dedup();
     }
 
+    if let Some(events) = stream {
+        inserted_data.sort_unstable();
+        inserted_data.dedup();
+        let now = Instant::now();
+        for &(slot, index) in &inserted_data {
+            if let Some((_, state_tracker)) = all_shreds.get_mut(&slot) {
+                let mut out = StreamOutput {
+                    slot,
+                    now,
+                    deshredded_entries: &mut *deshredded_entries,
+                    entry_ranges: &mut *entry_ranges,
+                    events: &mut *events,
+                    metrics,
+                };
+                drive_streams(state_tracker, index, &mut out);
+            }
+        }
+    }
+
     // deshred; validate guessed starts
     for (slot, candidate_index) in slot_fec_indexes_to_iterate.iter() {
         let Some((_all_shreds, state_tracker)) = all_shreds.get_mut(slot) else {
@@ -387,6 +430,21 @@ pub fn reconstruct_shred_payloads<'a>(
         else {
             continue;
         };
+        if streaming && !unknown_start {
+            // A complete batch with a proven start whose stream is still open: the stream
+            // stalled (a shred of another signed version of an FEC set). If it published
+            // nothing yet, publish the batch whole below (the mixed-version check still
+            // applies); otherwise the stream keeps it, so no entry goes out twice.
+            let start = start_data_complete_idx as u32;
+            if let Some(stream) = state_tracker.streams.get(&start) {
+                if !stream.early.is_empty() {
+                    continue;
+                }
+                let waiting = stream.next_index;
+                state_tracker.streams.remove(&start);
+                state_tracker.stream_waiting.remove(&waiting);
+            }
+        }
         if unknown_start {
             // A batch always starts on an FEC-set boundary; a guess inside a set is wrong.
             let on_fec_boundary = state_tracker.data_shreds[start_data_complete_idx]
@@ -570,6 +628,302 @@ pub fn reconstruct_shred_payloads<'a>(
     }
 
     total_recovered_count
+}
+
+// ------------------------------------------------------------------------------------
+// Streaming entry emission (`--stream-entries`)
+// ------------------------------------------------------------------------------------
+
+/// Stats-thread event from streaming emission (see `stream_stats.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamEvent {
+    /// An early record of a batch that has now completed. `gain_ns`: completion time
+    /// minus the record's publish time, i.e. how much sooner its entries went out than
+    /// whole-batch emission would have published them.
+    Early {
+        gain_ns: u64,
+        entries: u32,
+        transactions: u32,
+    },
+    /// A streamed batch completed; `entries`/`transactions` went out at completion.
+    /// `split`: the batch also had early records.
+    Completed {
+        split: bool,
+        entries: u32,
+        transactions: u32,
+    },
+}
+
+/// Receive-order cursor over one batch whose start is proven (index 0 of the slot, or the
+/// data shred before it is DATA_COMPLETE).
+///
+/// Every time data shreds extend the batch's contiguous prefix, the complete entries in the
+/// new bytes are published as one ordinary ring record: a valid bincode `Vec<Entry>` (u64
+/// LE count + the entries' exact bytes), so every consumer decodes it unchanged. When the
+/// batch's DATA_COMPLETE shred is appended, the entries not yet published go out as the
+/// last record, with any trailing zero padding. Each entry is published exactly once, and
+/// the concatenation of all records' entry bytes is the whole batch's. A batch completed in
+/// a single step is published exactly as the whole-batch path would (one record, the
+/// deshredded payload).
+///
+/// Not streamed early (published whole at completion): entry count 0 (Alpenglow block
+/// markers, empty batches) and a batch whose prefix fails the entry walk. Guessed-start
+/// batches never get a stream; they are validated and published whole.
+#[derive(Debug)]
+struct EntryStream {
+    next_index: u32,
+    /// Concatenated data of shreds `start..next_index`, as `Shredder::deshred` builds it.
+    data: Vec<u8>,
+    /// FEC set and leader signature of the last appended shred: a shred of another
+    /// version of the same set stalls the stream instead of being spliced in.
+    last_set: Option<(u32, Signature)>,
+    total_entries: Option<u64>,
+    /// Just past the last complete entry walked: byte offset, entries, transactions.
+    parsed: (usize, u64, u64),
+    /// Just past the last entry published.
+    emitted: (usize, u64, u64),
+    /// Early records: publish instant, entries, transactions.
+    early: Vec<(Instant, u32, u32)>,
+    whole_only: bool,
+}
+
+impl EntryStream {
+    fn new(start: u32) -> Self {
+        Self {
+            next_index: start,
+            data: Vec::with_capacity(64 * 1024),
+            last_set: None,
+            total_entries: None,
+            parsed: (8, 0, 0),
+            emitted: (8, 0, 0),
+            early: Vec::new(),
+            whole_only: false,
+        }
+    }
+
+    /// Walk every entry that is complete in `data` past the last walked one.
+    fn parse(&mut self, metrics: &ShredMetrics) {
+        if self.total_entries.is_none() && self.data.len() >= 8 {
+            let total = u64::from_le_bytes(self.data[..8].try_into().unwrap());
+            // 0: a block marker or an empty batch. Over the bound: not a batch header.
+            if total == 0 || total > (MAX_DATA_SHREDS_PER_SLOT * 1024 / 48) as u64 {
+                self.whole_only = true;
+            }
+            self.total_entries = Some(total);
+        }
+        let Some(total) = self.total_entries else {
+            return;
+        };
+        while !self.whole_only && self.parsed.1 < total {
+            match entry_walk::walk_entry(&self.data, self.parsed.0) {
+                Ok(entry_walk::EntryStep::Complete { end, transactions }) => {
+                    self.parsed = (end, self.parsed.1 + 1, self.parsed.2 + transactions);
+                }
+                Ok(entry_walk::EntryStep::Incomplete) => break,
+                Err(_) => {
+                    metrics
+                        .stream_malformed_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.whole_only = true;
+                }
+            }
+        }
+    }
+}
+
+/// Where stream records and events go during one `reconstruct_shred_payloads` call.
+struct StreamOutput<'a> {
+    slot: Slot,
+    now: Instant,
+    deshredded_entries: &'a mut Vec<(Slot, Vec<u8>)>,
+    entry_ranges: &'a mut Vec<(u32, u32, bool)>,
+    events: &'a mut Vec<StreamEvent>,
+    metrics: &'a ShredMetrics,
+}
+
+/// Data shred `index` just entered the tracker: continue the stream waiting for it, and
+/// start the stream of a batch whose start it proves or is.
+fn drive_streams(tracker: &mut ShredsStateTracker, index: u32, out: &mut StreamOutput) {
+    if let Some(start) = tracker.stream_waiting.remove(&index) {
+        advance_stream(tracker, start, out);
+    }
+    let i = index as usize;
+    if i == 0 || tracker.data_status[i - 1] == ShredStatus::DataComplete {
+        start_stream(tracker, index, out);
+    }
+    if tracker.data_status[i] == ShredStatus::DataComplete && i + 1 < MAX_DATA_SHREDS_PER_SLOT {
+        start_stream(tracker, index + 1, out);
+    }
+}
+
+fn start_stream(tracker: &mut ShredsStateTracker, start: u32, out: &mut StreamOutput) {
+    let i = start as usize;
+    if tracker.data_status[i] == ShredStatus::Unknown
+        || tracker.already_deshredded[i]
+        || tracker.streams.contains_key(&start)
+    {
+        return;
+    }
+    tracker.streams.insert(start, EntryStream::new(start));
+    advance_stream(tracker, start, out);
+}
+
+/// Append every contiguous data shred the stream can take, then publish what completed.
+fn advance_stream(tracker: &mut ShredsStateTracker, start: u32, out: &mut StreamOutput) {
+    let Some(mut stream) = tracker.streams.remove(&start) else {
+        return;
+    };
+    let mut complete = false;
+    let mut appended = false;
+    loop {
+        let i = stream.next_index as usize;
+        if i >= MAX_DATA_SHREDS_PER_SLOT
+            || tracker.already_deshredded[i]
+            || tracker.data_status[i] == ShredStatus::Unknown
+        {
+            break;
+        }
+        let shred = tracker.data_shreds[i].as_ref().unwrap();
+        let version = (shred.fec_set_index(), shred.common_header().signature);
+        if stream
+            .last_set
+            .is_some_and(|(fec, sig)| fec == version.0 && sig != version.1)
+        {
+            out.metrics
+                .stream_version_conflict_count
+                .fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        let Ok(data) = solana_ledger::shred::layout::get_data(shred.payload().as_ref()) else {
+            break;
+        };
+        stream.data.extend_from_slice(data);
+        stream.last_set = Some(version);
+        stream.next_index += 1;
+        appended = true;
+        if tracker.data_status[i] == ShredStatus::DataComplete {
+            complete = true;
+            break;
+        }
+    }
+    if complete {
+        finish_stream(tracker, start, stream, out);
+        return;
+    }
+    if appended {
+        stream.parse(out.metrics);
+        let (end, entries, transactions) = stream.parsed;
+        let (from, emitted_entries, emitted_txs) = stream.emitted;
+        if entries > emitted_entries {
+            let count = entries - emitted_entries;
+            let mut record = Vec::with_capacity(8 + end - from);
+            record.extend_from_slice(&count.to_le_bytes());
+            record.extend_from_slice(&stream.data[from..end]);
+            out.deshredded_entries.push((out.slot, record));
+            out.entry_ranges.push((start, stream.next_index - 1, false));
+            let txs = transactions - emitted_txs;
+            stream.early.push((out.now, count as u32, txs as u32));
+            stream.emitted = stream.parsed;
+            let m = out.metrics;
+            m.stream_records_early_count.fetch_add(1, Ordering::Relaxed);
+            m.stream_entries_early_count
+                .fetch_add(count, Ordering::Relaxed);
+            m.stream_txs_early_count.fetch_add(txs, Ordering::Relaxed);
+        }
+    }
+    tracker.stream_waiting.insert(stream.next_index, start);
+    tracker.streams.insert(start, stream);
+}
+
+/// The stream appended its batch's DATA_COMPLETE shred: publish the rest and retire it.
+fn finish_stream(
+    tracker: &mut ShredsStateTracker,
+    start: u32,
+    mut stream: EntryStream,
+    out: &mut StreamOutput,
+) {
+    let end = stream.next_index - 1;
+    stream.parse(out.metrics);
+    let total = stream.total_entries.unwrap_or(0);
+    let (from, emitted_entries, emitted_txs) = stream.emitted;
+    let remaining = total.saturating_sub(emitted_entries);
+    let remaining_txs = if stream.whole_only {
+        0
+    } else {
+        stream.parsed.2 - emitted_txs
+    };
+    let record = if stream.early.is_empty() {
+        // Nothing went out early: the whole batch, exactly as the whole-batch path
+        // publishes it (including deshred's zero-filled buffer for a batch with no data).
+        if stream.data.is_empty() {
+            Shredder::deshred(
+                tracker.data_shreds[start as usize..=end as usize]
+                    .iter()
+                    .map(|s| s.as_ref().unwrap().payload()),
+            )
+            .ok()
+        } else {
+            Some(std::mem::take(&mut stream.data))
+        }
+    } else if remaining == 0 && all_zero(&stream.data[from..]) {
+        None // everything was published early; only padding is left
+    } else {
+        let mut record = Vec::with_capacity(8 + stream.data.len() - from);
+        record.extend_from_slice(&remaining.to_le_bytes());
+        record.extend_from_slice(&stream.data[from..]);
+        Some(record)
+    };
+
+    let composing = &tracker.data_shreds[start as usize..=end as usize];
+    let needed_recovery = composing
+        .iter()
+        .flatten()
+        .any(|s| tracker.already_recovered_fec_sets[s.fec_set_index() as usize]);
+    for shred in composing.iter().flatten() {
+        tracker.already_recovered_fec_sets[shred.fec_set_index() as usize] = true;
+        tracker.already_deshredded[shred.index() as usize] = true;
+    }
+    let m = out.metrics;
+    if needed_recovery {
+        m.recovered_batch_count.fetch_add(1, Ordering::Relaxed);
+    }
+    if take_rejected_guesses(
+        &mut tracker.rejected_guess_starts,
+        start as usize,
+        end as usize,
+    ) {
+        m.held_batch_emitted_count.fetch_add(1, Ordering::Relaxed);
+    }
+    m.entry_count.fetch_add(total, Ordering::Relaxed);
+    m.stream_batches_count.fetch_add(1, Ordering::Relaxed);
+    m.stream_entries_completion_count
+        .fetch_add(remaining, Ordering::Relaxed);
+    m.stream_txs_completion_count
+        .fetch_add(remaining_txs, Ordering::Relaxed);
+    if let Some(record) = record {
+        out.deshredded_entries.push((out.slot, record));
+        out.entry_ranges.push((start, end, false));
+    }
+    let split = !stream.early.is_empty();
+    if split {
+        m.stream_batches_split_count.fetch_add(1, Ordering::Relaxed);
+    }
+    for &(published, entries, transactions) in &stream.early {
+        out.events.push(StreamEvent::Early {
+            gain_ns: out.now.duration_since(published).as_nanos() as u64,
+            entries,
+            transactions,
+        });
+    }
+    out.events.push(StreamEvent::Completed {
+        split,
+        entries: remaining as u32,
+        transactions: remaining_txs as u32,
+    });
+}
+
+fn all_zero(bytes: &[u8]) -> bool {
+    bytes.iter().all(|b| *b == 0)
 }
 
 /// After a recovery attempt fails, wait for this many more shreds of the set before the
@@ -1485,6 +1839,7 @@ mod tests {
                         &mut highest_slot_seen,
                         &rs_cache,
                         &metrics,
+                        None,
                     );
                     for (_, bytes) in entries.drain(..) {
                         emitted += 1;
@@ -1965,9 +2320,7 @@ pub(crate) mod validated_start_tests {
     use solana_perf::packet::{Packet, PacketBatch};
     use solana_sdk::{clock::Slot, hash::Hash, signature::Keypair};
 
-    use super::{
-        observe_known_start_batch, reconstruct_shreds, ComparableShred, ShredsStateTracker,
-    };
+    use super::{observe_known_start_batch, ComparableShred, ShredsStateTracker, StreamEvent};
     use crate::{
         entry_walk::{self, test_fixtures::*, BatchKind},
         forwarder::ShredMetrics,
@@ -2137,6 +2490,8 @@ pub(crate) mod validated_start_tests {
         highest_slot_seen: Slot,
         rs_cache: ReedSolomonCache,
         metrics: Arc<ShredMetrics>,
+        /// `Some`: `--stream-entries`, with every stream event so far.
+        stream: Option<Vec<StreamEvent>>,
     }
 
     /// One emitted batch: (payload, start index, end index, unknown_start).
@@ -2150,6 +2505,14 @@ pub(crate) mod validated_start_tests {
                 highest_slot_seen: 0,
                 rs_cache: ReedSolomonCache::default(),
                 metrics: Arc::new(ShredMetrics::default()),
+                stream: None,
+            }
+        }
+
+        fn streaming() -> Self {
+            Self {
+                stream: Some(vec![]),
+                ..Self::new()
             }
         }
 
@@ -2161,8 +2524,9 @@ pub(crate) mod validated_start_tests {
         ) -> Vec<Emitted> {
             let mut entries = vec![];
             let mut ranges = vec![];
-            reconstruct_shreds(
-                packets(shreds),
+            let packets = packets(shreds);
+            super::reconstruct_shred_payloads(
+                packets.iter().filter_map(|p| p.data(..)),
                 &mut self.all_shreds,
                 &mut self.scratch,
                 &mut entries,
@@ -2170,6 +2534,7 @@ pub(crate) mod validated_start_tests {
                 &mut self.highest_slot_seen,
                 &self.rs_cache,
                 &self.metrics,
+                self.stream.as_mut(),
             );
             entries
                 .into_iter()
@@ -2593,6 +2958,258 @@ pub(crate) mod validated_start_tests {
         );
         assert_eq!(count(&m.held_batch_emitted_count), 1);
         assert_eq!(count(&m.known_start_invalid_count), 1);
+    }
+
+    // --------------------------------------------------------------------------------
+    // --stream-entries
+    // --------------------------------------------------------------------------------
+
+    /// Records of one batch (same start index), in publish order.
+    fn records_of(out: &[Emitted], start: u32) -> Vec<&Vec<u8>> {
+        out.iter()
+            .filter(|(_, st, _, _)| *st == start)
+            .map(|(b, ..)| b)
+            .collect()
+    }
+
+    /// Entry count and concatenated entry bytes of a batch's records; every record must
+    /// be a well-formed Vec<Entry> on its own.
+    fn joined(records: &[&Vec<u8>]) -> (u64, Vec<u8>) {
+        let mut count = 0;
+        let mut bytes = vec![];
+        for r in records {
+            assert!(
+                entry_walk::validate_batch(r).is_ok(),
+                "record is not a valid Vec<Entry>"
+            );
+            count += u64::from_le_bytes(r[..8].try_into().unwrap());
+            bytes.extend_from_slice(&r[8..]);
+        }
+        (count, bytes)
+    }
+
+    /// `records` carry exactly `payload`'s entries, once each and in order (trailing zero
+    /// padding may be left out).
+    fn assert_exactly_once(records: &[&Vec<u8>], payload: &[u8]) {
+        let (count, bytes) = joined(records);
+        assert_eq!(count, u64::from_le_bytes(payload[..8].try_into().unwrap()));
+        let body = &payload[8..];
+        assert_eq!(&body[..bytes.len()], &bytes[..], "entry bytes differ");
+        assert!(
+            body[bytes.len()..].iter().all(|b| *b == 0),
+            "entries missing"
+        );
+    }
+
+    fn feed_each(proxy: &mut Proxy, shreds: &[&merkle::Shred]) -> Vec<Emitted> {
+        shreds.iter().flat_map(|s| proxy.feed([*s])).collect()
+    }
+
+    #[test]
+    fn streamed_in_order_entries_go_out_early_exactly_once() {
+        let s = three_batches(&[]);
+        let mut proxy = Proxy::streaming();
+        let out = feed_each(&mut proxy, &s.shreds.iter().collect::<Vec<_>>());
+        for (start, payload) in [(0, &s.z), (32, &s.a), (96, &s.b)] {
+            let records = records_of(&out, start);
+            assert!(records.len() > 4, "batch {start} was not streamed");
+            assert_exactly_once(&records, payload);
+        }
+        assert!(out.iter().all(|(_, _, _, unknown)| !unknown));
+        let m = proxy.metrics.clone();
+        assert_eq!(count(&m.stream_batches_count), 3);
+        assert_eq!(count(&m.stream_batches_split_count), 3);
+        assert_eq!(count(&m.known_start_invalid_count), 0);
+        let total_entries: u64 = [&s.z, &s.a, &s.b]
+            .iter()
+            .map(|p| u64::from_le_bytes(p[..8].try_into().unwrap()))
+            .sum();
+        assert_eq!(
+            count(&m.stream_entries_early_count) + count(&m.stream_entries_completion_count),
+            total_entries
+        );
+        // Every early record reported a gain once its batch completed.
+        let events = proxy.stream.as_ref().unwrap();
+        let early = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Early { .. }))
+            .count() as u64;
+        assert_eq!(early, count(&m.stream_records_early_count));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::Completed { split: true, .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn streamed_out_of_order_with_losses_and_recovery_exactly_once() {
+        // Deterministic shuffles of the whole slot, with 1 in 5 data shreds lost (sets
+        // recover from coding shreds). Records must still carry each entry once, in order.
+        let s = three_batches(&[]);
+        for seed in 0..8u64 {
+            let mut order: Vec<&merkle::Shred> = s
+                .shreds
+                .iter()
+                .filter(|x| !(is_data(x) && (x.index() as u64 + seed) % 5 == 0))
+                .collect();
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            for i in (1..order.len()).rev() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                order.swap(i, (state % (i as u64 + 1)) as usize);
+            }
+            let mut proxy = Proxy::streaming();
+            let mut out = vec![];
+            for chunk in order.chunks(1 + (seed as usize % 4)) {
+                out.extend(proxy.feed(chunk.iter().copied()));
+            }
+            for (start, payload) in [(0, &s.z), (32, &s.a), (96, &s.b)] {
+                let records = records_of(&out, start);
+                assert!(!records.is_empty(), "seed {seed}: batch {start} lost");
+                assert_exactly_once(&records, payload);
+            }
+            assert_eq!(
+                count(&proxy.metrics.fec_recovery_failed_count),
+                0,
+                "seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_batch_waits_for_recovery_to_replace_another_version() {
+        // The other version's data shreds 59..=63 take those indexes first. The stream
+        // publishes A's entries up to 58, stops at 59, and continues once recovery has put
+        // A's own shreds there: A's entries go out once each, none of the other version.
+        let v = two_versions_of_a();
+        let s = &v.main;
+        let mut feed: Vec<&merkle::Shred> = v
+            .other
+            .iter()
+            .filter(|x| in_set(x, 32, true) && x.index() >= 59)
+            .collect();
+        feed.extend(s.shreds.iter().filter(|x| x.fec_set_index() != 96));
+        let mut proxy = Proxy::streaming();
+        let out = feed_each(&mut proxy, &feed);
+        let records = records_of(&out, 32);
+        assert!(records.len() > 2);
+        assert_exactly_once(&records, &s.a);
+        assert_exactly_once(&records_of(&out, 0), &s.z);
+        assert!(count(&proxy.metrics.stream_version_conflict_count) >= 1);
+        assert_eq!(count(&proxy.metrics.fec_recovery_regrouped_count), 1);
+    }
+
+    #[test]
+    fn a_batch_completed_in_one_call_is_published_as_before() {
+        let s = three_batches(&[]);
+        let whole = Proxy::new().feed(&s.shreds);
+        let streamed = Proxy::streaming().feed(&s.shreds);
+        assert_eq!(whole, streamed);
+        assert_eq!(whole.len(), 3);
+    }
+
+    #[test]
+    fn guessed_start_batch_is_not_streamed() {
+        let s = three_batches(&[]);
+        // Z loses its DATA_COMPLETE shred and its coding shreds: A's start is a guess.
+        let order: Vec<&merkle::Shred> = s
+            .shreds
+            .iter()
+            .filter(|x| {
+                !((is_data(x) && x.index() == 31) || (!is_data(x) && x.fec_set_index() == 0))
+            })
+            .collect();
+        let mut proxy = Proxy::streaming();
+        let mut out = feed_each(&mut proxy, &order);
+        // Z streamed its first 31 shreds; A went out whole as a validated guess.
+        assert_eq!(records_of(&out, 32), vec![&s.a]);
+        assert!(out.iter().any(|(b, st, _, u)| *st == 32 && *u && b == &s.a));
+        out.extend(proxy.feed(s.shreds.iter().filter(|x| is_data(x) && x.index() == 31)));
+        assert_exactly_once(&records_of(&out, 0), &s.z);
+        assert_exactly_once(&records_of(&out, 96), &s.b);
+        assert_eq!(records_of(&out, 32).len(), 1);
+    }
+
+    #[test]
+    fn streamed_padding_marker_and_empty_batches() {
+        let mut leader = Leader::new();
+        let set = leader.fec_set_payload_bytes();
+        // Firedancer style: entries, then zero padding to two whole FEC sets.
+        let mut padded = payload_of_len(set / 2, &[]);
+        padded.resize(2 * set, 0);
+        let marker = block_header_marker(SLOT - 1, [9; 32]);
+        let tail = payload_of_len(set, &[]);
+        let mut shreds = leader.batch(&padded);
+        let marker_shreds = leader.batch(&marker);
+        let marker_start = marker_shreds[0].index();
+        shreds.extend(marker_shreds);
+        let tail_start = leader.next_data;
+        shreds.extend(leader.batch(&tail));
+        let mut proxy = Proxy::streaming();
+        let out = feed_each(&mut proxy, &shreds.iter().collect::<Vec<_>>());
+        // Every entry of the padded batch went out before its last (all-zero) shreds; no
+        // record carries only padding.
+        let padded_records = records_of(&out, 0);
+        assert_exactly_once(&padded_records, &padded);
+        assert!(padded_records
+            .iter()
+            .all(|r| u64::from_le_bytes(r[..8].try_into().unwrap()) > 0));
+        // The marker goes out whole, and the batch after it streams.
+        assert_eq!(records_of(&out, marker_start), vec![&marker]);
+        assert!(records_of(&out, tail_start).len() > 1);
+        assert_exactly_once(&records_of(&out, tail_start), &tail);
+        assert_eq!(count(&proxy.metrics.block_marker_count), 1);
+        assert_eq!(count(&proxy.metrics.known_start_invalid_count), 0);
+    }
+
+    /// Timing only:
+    /// `cargo test --release -p jito-shredstream-proxy bench_stream_overhead -- --ignored --nocapture`.
+    /// Per-packet reconstruct cost with and without --stream-entries, one shred per call
+    /// (the worst case for streaming: a walk after every data shred).
+    #[test]
+    #[ignore = "timing only; run with --ignored --nocapture"]
+    fn bench_stream_overhead() {
+        use std::time::Instant;
+        let mut leader = Leader::new();
+        let set = leader.fec_set_payload_bytes();
+        let payloads: Vec<Vec<u8>> = (0..40).map(|_| payload_of_len(2 * set, &[])).collect();
+        let shreds: Vec<merkle::Shred> = payloads.iter().flat_map(|p| leader.batch(p)).collect();
+        let packets: Vec<PacketBatch> = shreds.iter().map(|s| packets([s])).collect();
+        for streaming in [false, true, false, true] {
+            let mut proxy = if streaming {
+                Proxy::streaming()
+            } else {
+                Proxy::new()
+            };
+            let (mut entries, mut ranges) = (vec![], vec![]);
+            let started = Instant::now();
+            let mut records = 0;
+            for p in &packets {
+                super::reconstruct_shred_payloads(
+                    p.iter().filter_map(|p| p.data(..)),
+                    &mut proxy.all_shreds,
+                    &mut proxy.scratch,
+                    &mut entries,
+                    &mut ranges,
+                    &mut proxy.highest_slot_seen,
+                    &proxy.rs_cache,
+                    &proxy.metrics,
+                    proxy.stream.as_mut(),
+                );
+                records += entries.len();
+            }
+            let per_packet = started.elapsed().as_nanos() as f64 / packets.len() as f64;
+            println!(
+                "stream={streaming}: {:.2} us per packet ({} packets, {} records, 40 two-set batches)",
+                per_packet / 1000.0,
+                packets.len(),
+                records
+            );
+        }
     }
 
     #[test]

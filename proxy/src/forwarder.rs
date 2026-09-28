@@ -31,7 +31,9 @@ use solana_streamer::{
 };
 use tokio::sync::broadcast::Sender;
 
-use crate::{deshred, resolve_hostname_port, ShredstreamProxyError};
+use crate::{
+    deshred, resolve_hostname_port, stream_stats::StreamStatsHandle, ShredstreamProxyError,
+};
 
 // values copied from https://github.com/solana-labs/solana/blob/33bde55bbdde13003acf45bb6afe6db4ab599ae4/core/src/sigverify_shreds.rs#L20
 pub const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
@@ -58,6 +60,7 @@ pub fn start_forwarder_threads(
     bench_kernel_timestamps: bool,
     pipeline_handle: Option<crate::benchmark::PipelineLatencyHandle>,
     lean_ingest: Option<crate::lean_ingest::LeanIngestConfig>,
+    stream_stats: Option<StreamStatsHandle>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
@@ -106,6 +109,7 @@ pub fn start_forwarder_threads(
             bench_handle,
             bench_kernel_timestamps,
             pipeline_handle,
+            stream_stats,
             exit,
         );
     }
@@ -126,6 +130,7 @@ pub fn start_forwarder_threads(
                     entry_sender,
                     pipeline_handle,
                     metrics,
+                    stream_stats,
                 );
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
@@ -271,15 +276,19 @@ pub(crate) struct Reconstructor {
     entry_sender: Arc<Sender<PbEntry>>,
     pipeline_handle: Option<crate::benchmark::PipelineLatencyHandle>,
     metrics: Arc<ShredMetrics>,
+    /// `--stream-entries`: events of the current call, and where they go.
+    stream: Option<(Vec<deshred::StreamEvent>, StreamStatsHandle)>,
 }
 
 impl Reconstructor {
     /// Creates (truncates) the shmem ring if configured; panics if that fails.
+    /// `stream_stats`: `Some` turns on streaming entry emission.
     pub(crate) fn new(
         shmem_ring_path: Option<&std::path::Path>,
         entry_sender: Arc<Sender<PbEntry>>,
         pipeline_handle: Option<crate::benchmark::PipelineLatencyHandle>,
         metrics: Arc<ShredMetrics>,
+        stream_stats: Option<StreamStatsHandle>,
     ) -> Self {
         Self {
             shmem_ring: shmem_ring_path.map(|path| {
@@ -295,6 +304,7 @@ impl Reconstructor {
             entry_sender,
             pipeline_handle,
             metrics,
+            stream: stream_stats.map(|handle| (Vec::new(), handle)),
         }
     }
 
@@ -310,6 +320,7 @@ impl Reconstructor {
             &mut self.highest_slot_seen,
             &self.rs_cache,
             &self.metrics,
+            self.stream.as_mut().map(|(events, _)| events),
         );
 
         for ((slot, entries_bytes), &(start_index, end_index, unknown_start)) in
@@ -361,11 +372,17 @@ impl Reconstructor {
                 );
             }
 
-            // Then gRPC broadcast (existing path).
+            // Then gRPC broadcast (existing path). With --stream-entries it carries the
+            // same records as the ring.
             let _ = self.entry_sender.send(PbEntry {
                 slot,
                 entries: entries_bytes,
             });
+        }
+        if let Some((events, stats)) = self.stream.as_mut() {
+            for event in events.drain(..) {
+                stats.record(event);
+            }
         }
     }
 }
@@ -668,6 +685,21 @@ pub struct ShredMetrics {
     /// Complete batches held back because an FEC set in them mixes data shreds of two
     /// signed versions (released once recovery replaces the minority version)
     pub mixed_version_batch_held_count: AtomicU64,
+    // --stream-entries
+    /// Records published before their batch completed, and the entries/txs in them
+    pub stream_records_early_count: AtomicU64,
+    pub stream_entries_early_count: AtomicU64,
+    pub stream_txs_early_count: AtomicU64,
+    /// Entries/txs published when their batch completed
+    pub stream_entries_completion_count: AtomicU64,
+    pub stream_txs_completion_count: AtomicU64,
+    /// Streamed batches completed, and those that had early records
+    pub stream_batches_count: AtomicU64,
+    pub stream_batches_split_count: AtomicU64,
+    /// Streams stopped by a data shred of another signed version of the same FEC set
+    pub stream_version_conflict_count: AtomicU64,
+    /// Streamed batches whose prefix failed the entry walk (published whole instead)
+    pub stream_malformed_count: AtomicU64,
     /// Number of bincode Entry deserialization errors
     pub bincode_deserialize_error_count: AtomicU64,
     /// Number of times we couldn't find the previous DATA_COMPLETE_SHRED flag but tried to deshred+deserialize, and failed
@@ -725,6 +757,15 @@ impl ShredMetrics {
             fec_recovery_regrouped_count: Default::default(),
             fec_recovery_retry_skipped_count: Default::default(),
             mixed_version_batch_held_count: Default::default(),
+            stream_records_early_count: Default::default(),
+            stream_entries_early_count: Default::default(),
+            stream_txs_early_count: Default::default(),
+            stream_entries_completion_count: Default::default(),
+            stream_txs_completion_count: Default::default(),
+            stream_batches_count: Default::default(),
+            stream_batches_split_count: Default::default(),
+            stream_version_conflict_count: Default::default(),
+            stream_malformed_count: Default::default(),
             bincode_deserialize_error_count: Default::default(),
             unknown_start_position_error_count: Default::default(),
             unknown_start_mid_fec_count: Default::default(),
@@ -825,6 +866,53 @@ impl ShredMetrics {
                     "mixed_version_batch_held_count",
                     self.mixed_version_batch_held_count
                         .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "stream_records_early_count",
+                    self.stream_records_early_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "stream_entries_early_count",
+                    self.stream_entries_early_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "stream_txs_early_count",
+                    self.stream_txs_early_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "stream_entries_completion_count",
+                    self.stream_entries_completion_count
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "stream_txs_completion_count",
+                    self.stream_txs_completion_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "stream_batches_count",
+                    self.stream_batches_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "stream_batches_split_count",
+                    self.stream_batches_split_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "stream_version_conflict_count",
+                    self.stream_version_conflict_count
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "stream_malformed_count",
+                    self.stream_malformed_count.swap(0, Ordering::Relaxed),
                     i64
                 ),
                 (

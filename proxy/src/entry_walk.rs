@@ -265,20 +265,8 @@ pub fn validate_batch(payload: &[u8]) -> Result<BatchKind, WalkError> {
     }
     let mut transactions = 0u64;
     for _ in 0..entry_count {
-        // num_hashes + hash
-        c.skip(8 + HASH_BYTES)?;
-        let at = c.pos;
-        let tx_count = c.u64_le()?;
-        if tx_count > (c.remaining() / MIN_TRANSACTION_BYTES) as u64 {
-            return Err(WalkError::ImplausibleCount {
-                at,
-                count: tx_count,
-            });
-        }
-        for _ in 0..tx_count {
-            walk_transaction(&mut c)?;
-        }
-        transactions += tx_count;
+        let max_transactions = (c.remaining() / MIN_TRANSACTION_BYTES) as u64;
+        transactions += walk_entry_at(&mut c, max_transactions)?;
     }
     if !all_zero(&payload[c.pos..]) {
         return Err(WalkError::TrailingBytes {
@@ -303,6 +291,54 @@ fn all_zero(bytes: &[u8]) -> bool {
         }
     }
     chunks.remainder().iter().all(|b| *b == 0)
+}
+
+/// One entry at the cursor: num_hashes, hash, transaction count, transactions. Returns the
+/// transaction count. `max_transactions` bounds the declared count.
+#[inline(always)]
+fn walk_entry_at(c: &mut Cursor<'_>, max_transactions: u64) -> Result<u64, WalkError> {
+    // num_hashes + hash
+    c.skip(8 + HASH_BYTES)?;
+    let at = c.pos;
+    let tx_count = c.u64_le()?;
+    if tx_count > max_transactions {
+        return Err(WalkError::ImplausibleCount {
+            at,
+            count: tx_count,
+        });
+    }
+    for _ in 0..tx_count {
+        walk_transaction(c)?;
+    }
+    Ok(tx_count)
+}
+
+/// Upper bound on the transactions one entry of a batch still being received may declare:
+/// a whole slot of data shreds (32768 x ~1 KB) of minimum-size transactions.
+const MAX_STREAMED_ENTRY_TRANSACTIONS: u64 = 1 << 18;
+
+/// Result of walking one entry in a prefix of a batch payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryStep {
+    /// The entry ends at byte `end` of the prefix.
+    Complete { end: usize, transactions: u64 },
+    /// The prefix ends inside the entry; more bytes may complete it.
+    Incomplete,
+}
+
+/// Walk the entry that starts at byte `pos` of `prefix`, the received-so-far prefix of a
+/// batch payload (streaming emission). Running out of bytes is `Incomplete`, not an error;
+/// every other malformation is an error. Never allocates.
+pub fn walk_entry(prefix: &[u8], pos: usize) -> Result<EntryStep, WalkError> {
+    let mut c = Cursor { bytes: prefix, pos };
+    match walk_entry_at(&mut c, MAX_STREAMED_ENTRY_TRANSACTIONS) {
+        Ok(transactions) => Ok(EntryStep::Complete {
+            end: c.pos,
+            transactions,
+        }),
+        Err(WalkError::UnexpectedEof { .. }) => Ok(EntryStep::Incomplete),
+        Err(e) => Err(e),
+    }
 }
 
 /// Entry count 0: an Alpenglow block marker, or an empty batch.
@@ -698,6 +734,49 @@ mod tests {
             validate_batch(&wrap(&bad)),
             Err(WalkError::ShortU16 { .. })
         ));
+    }
+
+    #[test]
+    fn walk_entry_resumes_over_a_growing_prefix() {
+        let [legacy, v0, v1_small, v1_large] = real_transactions();
+        let bytes = batch_of(&[
+            (5, [9; 32], &[&legacy, &v1_small]),
+            (0, [1; 32], &[]),
+            (6, [7; 32], &[&v0, &v1_large, &legacy]),
+        ]);
+        let ends = {
+            let e0 = 8 + 48 + legacy.len() + v1_small.len();
+            let e1 = e0 + 48;
+            [e0, e1, bytes.len()]
+        };
+        let txs = [2u64, 0, 3];
+        // For every prefix length, the entries fully inside it are Complete and the next
+        // one is Incomplete.
+        for len in 8..=bytes.len() {
+            let prefix = &bytes[..len];
+            let mut pos = 8;
+            for (k, &end) in ends.iter().enumerate() {
+                let step = walk_entry(prefix, pos).unwrap();
+                if end <= len {
+                    assert_eq!(
+                        step,
+                        EntryStep::Complete {
+                            end,
+                            transactions: txs[k]
+                        },
+                        "len {len} entry {k}"
+                    );
+                    pos = end;
+                } else {
+                    assert_eq!(step, EntryStep::Incomplete, "len {len} entry {k}");
+                    break;
+                }
+            }
+        }
+        // A malformation is an error, not Incomplete.
+        let mut bad = bytes.clone();
+        bad[8 + 48] = 0x82;
+        assert!(walk_entry(&bad, 8).is_err());
     }
 
     #[test]
