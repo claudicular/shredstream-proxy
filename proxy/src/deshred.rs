@@ -398,13 +398,24 @@ pub fn reconstruct_shred_payloads<'a>(
             end_data_complete_idx as u32,
             unknown_start,
         ));
+        // Before marking: a composing set already flagged here was completed by the RS
+        // recovery above (a batch shares no FEC set with another batch).
+        let needed_recovery = to_deshred
+            .iter()
+            .flatten()
+            .any(|shred| state_tracker.already_recovered_fec_sets[shred.fec_set_index() as usize]);
         to_deshred.iter().for_each(|shred| {
             let Some(shred) = shred.as_ref() else {
                 return;
             };
             state_tracker.already_recovered_fec_sets[shred.fec_set_index() as usize] = true;
             state_tracker.already_deshredded[shred.index() as usize] = true;
-        })
+        });
+        if needed_recovery {
+            metrics
+                .recovered_batch_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     if all_shreds.len() > MAX_PROCESSING_AGE {
@@ -1946,6 +1957,49 @@ mod validated_start_tests {
                 .filter(|x| !is_data(x) && x.fec_set_index() == 32),
         );
         assert_eq!(out, vec![(s.a.clone(), 32, 95, false)]);
+    }
+
+    #[test]
+    fn any_32_of_64_shreds_recover_the_set_and_emit_in_the_same_call() {
+        let s = three_batches(&[]);
+        // A's first set (32..=63): only 16 data shreds (32..=47) arrive, plus 15 of its
+        // coding shreds. Everything else of Z and A arrives too.
+        let set32_code: Vec<u32> = s
+            .shreds
+            .iter()
+            .filter(|x| !is_data(x) && x.fec_set_index() == 32)
+            .map(|x| x.index())
+            .collect();
+        assert_eq!(set32_code.len(), 32);
+        let first = s.shreds.iter().filter(|x| {
+            let fec = x.fec_set_index();
+            if fec == 96 {
+                return false; // B
+            }
+            if fec != 32 {
+                return true;
+            }
+            if is_data(x) {
+                x.index() <= 47
+            } else {
+                set32_code[..15].contains(&x.index())
+            }
+        });
+        let mut proxy = Proxy::new();
+        let out = proxy.feed(first);
+        // 31 of 64: Z only.
+        assert_eq!(out, vec![(s.z.clone(), 0, 31, false)]);
+        assert_eq!(count(&proxy.metrics.recovered_batch_count), 0);
+
+        // The 32nd shred (a coding shred) recovers the 16 missing data shreds and A goes
+        // out in the same call, without waiting for any late data shred.
+        let out = proxy.feed(
+            s.shreds
+                .iter()
+                .filter(|x| !is_data(x) && x.index() == set32_code[15]),
+        );
+        assert_eq!(out, vec![(s.a.clone(), 32, 95, false)]);
+        assert_eq!(count(&proxy.metrics.recovered_batch_count), 1);
     }
 
     #[test]

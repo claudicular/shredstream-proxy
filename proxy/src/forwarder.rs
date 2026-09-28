@@ -611,6 +611,9 @@ pub struct ShredMetrics {
     pub enabled_grpc_service: bool,
     /// Number of data shreds recovered using coding shreds
     pub recovered_count: AtomicU64,
+    /// Emitted batches that needed Reed-Solomon recovery to complete (recovery runs as
+    /// soon as any 32 distinct shreds of an FEC set are present)
+    pub recovered_batch_count: AtomicU64,
     /// Number of Solana entries decoded from shreds
     pub entry_count: AtomicU64,
     /// Number of transactions decoded from shreds
@@ -664,6 +667,7 @@ impl ShredMetrics {
             duplicate: Default::default(),
             packets_received: DashMap::with_capacity(10),
             recovered_count: Default::default(),
+            recovered_batch_count: Default::default(),
             entry_count: Default::default(),
             txn_count: Default::default(),
             unknown_start_position_count: Default::default(),
@@ -709,6 +713,11 @@ impl ShredMetrics {
                 (
                     "recovered_count",
                     self.recovered_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "recovered_batch_count",
+                    self.recovered_batch_count.swap(0, Ordering::Relaxed),
                     i64
                 ),
                 (
