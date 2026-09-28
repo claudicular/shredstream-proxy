@@ -39,3 +39,6 @@ solana-streamer = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+
+[dev-dependencies]
+base64 = "0.22.1"

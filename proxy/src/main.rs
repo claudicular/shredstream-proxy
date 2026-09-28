@@ -36,6 +36,7 @@ use crate::{
 };
 pub mod benchmark;
 mod deshred;
+mod entry_walk;
 pub mod forwarder;
 mod heartbeat;
 mod multicast_config;

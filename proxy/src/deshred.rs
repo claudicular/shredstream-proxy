@@ -1,4 +1,9 @@
-use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering};
+use std::{
+    collections::HashSet,
+    hash::Hash,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use itertools::Itertools;
 use jito_protos::shredstream::TraceShred;
@@ -15,7 +20,10 @@ use solana_metrics::datapoint_warn;
 use solana_perf::packet::PacketBatch;
 use solana_sdk::clock::{Slot, MAX_PROCESSING_AGE};
 
-use crate::forwarder::ShredMetrics;
+use crate::{
+    entry_walk::{self, BatchKind},
+    forwarder::ShredMetrics,
+};
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 enum ShredStatus {
@@ -39,6 +47,11 @@ pub struct ShredsStateTracker {
     already_recovered_fec_sets: Vec<bool>,
     /// array of bools that track which data shred indexes have been already deshredded
     already_deshredded: Vec<bool>,
+    /// Bitset of data shred indexes at which a guessed batch start was tried and rejected
+    /// (failed the structural walk or failed to deshred). The payload of a guessed batch is
+    /// fixed until the shred before its start arrives, and that arrival changes the
+    /// candidate start, so a set bit means "retrying this exact guess is pointless".
+    rejected_guess_starts: Vec<u64>,
 }
 impl Default for ShredsStateTracker {
     fn default() -> Self {
@@ -47,8 +60,35 @@ impl Default for ShredsStateTracker {
             data_shreds: vec![None; MAX_DATA_SHREDS_PER_SLOT],
             already_recovered_fec_sets: vec![false; MAX_DATA_SHREDS_PER_SLOT],
             already_deshredded: vec![false; MAX_DATA_SHREDS_PER_SLOT],
+            rejected_guess_starts: vec![0; MAX_DATA_SHREDS_PER_SLOT.div_ceil(64)],
         }
     }
+}
+
+impl ShredsStateTracker {
+    fn is_rejected_guess(&self, start: usize) -> bool {
+        self.rejected_guess_starts[start / 64] & (1 << (start % 64)) != 0
+    }
+
+    fn reject_guess(&mut self, start: usize) {
+        self.rejected_guess_starts[start / 64] |= 1 << (start % 64);
+    }
+}
+
+/// Clears every bit in `start..=end` of a rejected-guess bitset; true if any was set, i.e.
+/// the batch being emitted had been held back by a rejected guess. A free function so it
+/// can run while the tracker's `data_shreds` is borrowed.
+fn take_rejected_guesses(bits: &mut [u64], start: usize, end: usize) -> bool {
+    let (first, last) = (start / 64, end / 64);
+    let mut any = false;
+    for (word, value) in bits.iter_mut().enumerate().take(last + 1).skip(first) {
+        let lo = if word == first { start % 64 } else { 0 };
+        let hi = if word == last { end % 64 } else { 63 };
+        let mask = (u64::MAX >> (63 - hi)) & (u64::MAX << lo);
+        any |= *value & mask != 0;
+        *value &= !mask;
+    }
+    any
 }
 
 /// Returns the number of shreds reconstructed
@@ -56,6 +96,20 @@ impl Default for ShredsStateTracker {
 /// receive shreds per FEC set, attempting to recover the other shreds in the fec set so you do not have to wait until all data shreds have arrived.
 /// every time a fec is recovered, scan for neighbouring DATA_COMPLETE_SHRED flags in the shreds, attempting to deserialize into solana entries when there are no missing shreds between the DATA_COMPLETE_SHRED flags.
 /// note that an FEC set doesn't necessarily contain DATA_COMPLETE_SHRED in the last shred. when deserializing the bincode data, you must use data between shreds starting at the last DATA_COMPLETE_SHRED (not inclusive) to the next DATA_COMPLETE_SHRED (inclusive)
+///
+/// Batch starts. A batch whose preceding shred is DATA_COMPLETE (or that starts at index 0)
+/// has a proven start and is emitted as soon as it is contiguous. When the preceding shred
+/// is still missing the start is a guess. Leaders serialize and shred every batch on its
+/// own, so a batch always begins on an FEC-set boundary: a guess inside an FEC set is always
+/// wrong and is never emitted (the set's missing shred arrives or is recovered first). A
+/// guess on a boundary is right only if the previous set ended a batch, so it is emitted
+/// only if the payload passes a structural walk that must end where the payload's nonzero
+/// bytes end (`entry_walk::validate_batch`). A rejected guess marks nothing as consumed:
+/// the batch is emitted later, whole, once its real start resolves. `rejected_guess_starts`
+/// stops the same guess from being re-deshredded on every later shred of the slot.
+///
+/// `slot_fec_indexes_to_iterate` is scratch space; after recovery it also holds the index
+/// after every newly known DATA_COMPLETE shred, whose batch just gained a proven start.
 #[allow(clippy::too_many_arguments)]
 pub fn reconstruct_shreds(
     packet_batch: PacketBatch,
@@ -80,6 +134,9 @@ pub fn reconstruct_shreds(
     deshredded_entries.clear();
     entry_ranges.clear();
     slot_fec_indexes_to_iterate.clear();
+    // (slot, index after a newly known DATA_COMPLETE data shred): batches whose start just
+    // became proven. Usually empty or one element per packet batch.
+    let mut proven_starts = Vec::<(Slot, u32)>::new();
     // ingest all packets
     for packet in packet_batch.iter().filter_map(|p| p.data(..)) {
         match solana_ledger::shred::Shred::new_from_serialized_shred(packet.to_vec())
@@ -105,6 +162,11 @@ pub fn reconstruct_shreds(
                 let Some(_shred_index) = update_state_tracker(&shred, state_tracker) else {
                     continue;
                 };
+                if shred.shred_type() == ShredType::Data
+                    && state_tracker.data_status[index] == ShredStatus::DataComplete
+                {
+                    proven_starts.push((slot, index as u32 + 1));
+                }
 
                 all_shreds
                     .entry(fec_set_index)
@@ -166,8 +228,13 @@ pub fn reconstruct_shreds(
         for shred in recovered {
             match shred {
                 Ok(shred) => {
-                    if update_state_tracker(&shred, state_tracker).is_none() {
+                    let Some(index) = update_state_tracker(&shred, state_tracker) else {
                         continue; // already seen before in state tracker
+                    };
+                    if shred.shred_type() == ShredType::Data
+                        && state_tracker.data_status[index] == ShredStatus::DataComplete
+                    {
+                        proven_starts.push((*slot, index as u32 + 1));
                     }
                     // shreds.insert(ComparableShred(shred)); // optional since all data shreds are in state_tracker
                     total_recovered_count += 1;
@@ -186,15 +253,42 @@ pub fn reconstruct_shreds(
         }
     }
 
-    // deshred and bincode deserialize
-    for (slot, fec_set_index) in slot_fec_indexes_to_iterate.iter() {
-        let (_all_shreds, state_tracker) = all_shreds.entry(*slot).or_default();
+    // Candidates for emission: every touched FEC set, plus every batch whose start was just
+    // proven by a newly known DATA_COMPLETE shred. The latter matters when that batch is
+    // not touched in this packet batch (e.g. it was held back by a rejected guess).
+    if !proven_starts.is_empty() {
+        slot_fec_indexes_to_iterate.extend(proven_starts);
+        slot_fec_indexes_to_iterate.sort_unstable();
+        slot_fec_indexes_to_iterate.dedup();
+    }
+
+    // deshred; validate guessed starts
+    for (slot, candidate_index) in slot_fec_indexes_to_iterate.iter() {
+        let Some((_all_shreds, state_tracker)) = all_shreds.get_mut(slot) else {
+            continue;
+        };
         let Some((start_data_complete_idx, end_data_complete_idx, unknown_start)) =
-            get_indexes(state_tracker, *fec_set_index as usize)
+            get_indexes(state_tracker, *candidate_index as usize)
         else {
             continue;
         };
         if unknown_start {
+            // A batch always starts on an FEC-set boundary; a guess inside a set is wrong.
+            let on_fec_boundary = state_tracker.data_shreds[start_data_complete_idx]
+                .as_ref()
+                .is_some_and(|s| s.fec_set_index() as usize == start_data_complete_idx);
+            if !on_fec_boundary {
+                metrics
+                    .unknown_start_mid_fec_count
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if state_tracker.is_rejected_guess(start_data_complete_idx) {
+                metrics
+                    .unknown_start_retry_skipped_count
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             metrics
                 .unknown_start_position_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -215,10 +309,38 @@ pub fn reconstruct_shreds(
                     metrics
                         .unknown_start_position_error_count
                         .fetch_add(1, Ordering::Relaxed);
+                    state_tracker.reject_guess(start_data_complete_idx);
                 }
                 continue;
             }
         };
+
+        if unknown_start {
+            let started = Instant::now();
+            let walk = entry_walk::validate_batch(&deshredded_payload);
+            record_walk_time(metrics, started);
+            match walk {
+                Ok(kind) => {
+                    metrics
+                        .unknown_start_validated_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    record_batch_kind(metrics, kind);
+                }
+                Err(e) => {
+                    // Most likely the guess landed inside a multi-set batch. Keep every
+                    // shred; the whole batch is emitted once the real start resolves.
+                    metrics
+                        .unknown_start_invalid_count
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "slot {slot}: guessed batch start {start_data_complete_idx}..={end_data_complete_idx} rejected ({} bytes): {e}",
+                        deshredded_payload.len()
+                    );
+                    state_tracker.reject_guess(start_data_complete_idx);
+                    continue;
+                }
+            }
+        }
 
         // Read entry count from bincode header (first 8 bytes = Vec length as little-endian u64)
         // Skip full deserialization — consumer deserializes on its end
@@ -227,6 +349,17 @@ pub fn reconstruct_shreds(
             metrics
                 .entry_count
                 .fetch_add(entry_count, Ordering::Relaxed);
+        }
+
+        if take_rejected_guesses(
+            &mut state_tracker.rejected_guess_starts,
+            start_data_complete_idx,
+            end_data_complete_idx,
+        ) {
+            metrics
+                .held_batch_emitted_count
+                .fetch_add(1, Ordering::Relaxed);
+            debug!("slot {slot}: held batch {start_data_complete_idx}..={end_data_complete_idx} emitted after its start resolved");
         }
 
         deshredded_entries.push((*slot, deshredded_payload));
@@ -302,6 +435,63 @@ pub fn reconstruct_shreds(
     }
 
     total_recovered_count
+}
+
+/// Structural check of a batch whose start was proven (the shred before it is
+/// DATA_COMPLETE, or it starts the slot), run by the reconstruct thread *after* the batch
+/// was published so the known-start path pays nothing for it. Such a batch is published
+/// regardless: its start cannot be wrong, so a failure here means a transaction format this
+/// walk does not know (the SIMD-0385 failure mode) or an equivocating leader's mixed shreds,
+/// and the consumer is the right place to decide. Failures are counted and logged (rate
+/// limited) so a new wire format is loud instead of silent.
+pub fn observe_known_start_batch(
+    slot: Slot,
+    start_index: u32,
+    end_index: u32,
+    payload: &[u8],
+    metrics: &ShredMetrics,
+) {
+    let started = Instant::now();
+    let walk = entry_walk::validate_batch(payload);
+    record_walk_time(metrics, started);
+    match walk {
+        Ok(kind) => record_batch_kind(metrics, kind),
+        Err(e) => {
+            metrics
+                .known_start_invalid_count
+                .fetch_add(1, Ordering::Relaxed);
+            static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if LAST_WARN_SECS.swap(now_secs, Ordering::Relaxed) != now_secs {
+                warn!(
+                    "slot {slot}: published batch {start_index}..={end_index} ({} bytes) has a proven start but does not parse: {e}; first bytes {:02x?}",
+                    payload.len(),
+                    &payload[..payload.len().min(16)]
+                );
+            }
+        }
+    }
+}
+
+fn record_batch_kind(metrics: &ShredMetrics, kind: BatchKind) {
+    match kind {
+        BatchKind::Entries { transactions, .. } => {
+            metrics.txn_count.fetch_add(transactions, Ordering::Relaxed);
+        }
+        BatchKind::BlockMarker { .. } | BatchKind::Empty => {
+            metrics.block_marker_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn record_walk_time(metrics: &ShredMetrics, started: Instant) {
+    metrics
+        .batch_walk_ns
+        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    metrics.batch_walk_count.fetch_add(1, Ordering::Relaxed);
 }
 
 #[allow(unused)]
@@ -1210,3 +1400,4 @@ mod get_indexes_tests {
         assert_eq!(get_indexes(&tracker, 3), Some((3, 4, false)));
     }
 }
+

@@ -132,12 +132,12 @@ pub fn start_forwarder_threads(
                                 &metrics,
                             );
 
-                            for ((slot, entries_bytes), (start_index, end_index, unknown_start)) in
-                                deshredded_entries.drain(..).zip(entry_ranges.drain(..))
+                            for ((slot, entries_bytes), &(start_index, end_index, unknown_start)) in
+                                deshredded_entries.iter().zip(entry_ranges.iter())
                             {
                                 // Shmem write FIRST (lowest latency path) — unchanged.
                                 if let Some(ref mut ring) = shmem_ring {
-                                    ring.publish(slot, &entries_bytes);
+                                    ring.publish(*slot, entries_bytes);
                                 }
 
                                 // Pipeline latency: AFTER the shmem write (so it never
@@ -151,12 +151,32 @@ pub fn start_forwarder_threads(
                                         .map(|d| d.as_nanos() as i64)
                                         .unwrap_or(0);
                                     ph.record(crate::benchmark::aggregator::PublishEvent {
-                                        slot,
+                                        slot: *slot,
                                         start_index,
                                         end_index,
                                         unknown_start,
                                         publish_ts_ns,
                                     });
+                                }
+                            }
+
+                            // Every batch of this packet batch is in the ring before any
+                            // of the work below runs.
+                            for ((slot, entries_bytes), (start_index, end_index, unknown_start)) in
+                                deshredded_entries.drain(..).zip(entry_ranges.drain(..))
+                            {
+                                // Proven-start batches were published unchecked; walk
+                                // them now, off the publish path, for metrics and to make
+                                // an unknown wire format loud. Guessed starts were
+                                // validated before they were emitted.
+                                if !unknown_start {
+                                    deshred::observe_known_start_batch(
+                                        slot,
+                                        start_index,
+                                        end_index,
+                                        &entries_bytes,
+                                        &metrics,
+                                    );
                                 }
 
                                 // Then gRPC broadcast (existing path).
@@ -569,6 +589,23 @@ pub struct ShredMetrics {
     pub bincode_deserialize_error_count: AtomicU64,
     /// Number of times we couldn't find the previous DATA_COMPLETE_SHRED flag but tried to deshred+deserialize, and failed
     pub unknown_start_position_error_count: AtomicU64,
+    /// Guessed starts inside an FEC set, never emitted (batches start on FEC boundaries)
+    pub unknown_start_mid_fec_count: AtomicU64,
+    /// Repeats of an already rejected guess, skipped without deshredding
+    pub unknown_start_retry_skipped_count: AtomicU64,
+    /// Guessed starts whose payload passed the structural walk and were emitted
+    pub unknown_start_validated_count: AtomicU64,
+    /// Guessed starts whose payload failed the structural walk; shreds kept for a retry
+    pub unknown_start_invalid_count: AtomicU64,
+    /// Batches held back by a rejected guess and emitted later, once their start resolved
+    pub held_batch_emitted_count: AtomicU64,
+    /// Proven-start batches that do not parse (published anyway; see `deshred.rs`)
+    pub known_start_invalid_count: AtomicU64,
+    /// Alpenglow block markers and empty batches (entry count 0)
+    pub block_marker_count: AtomicU64,
+    /// Total time and count of structural batch walks (mean = ns / count)
+    pub batch_walk_ns: AtomicU64,
+    pub batch_walk_count: AtomicU64,
 
     // cumulative metrics (persist after reset)
     pub agg_received_cumulative: AtomicU64,
@@ -599,6 +636,15 @@ impl ShredMetrics {
             fec_recovery_error_count: Default::default(),
             bincode_deserialize_error_count: Default::default(),
             unknown_start_position_error_count: Default::default(),
+            unknown_start_mid_fec_count: Default::default(),
+            unknown_start_retry_skipped_count: Default::default(),
+            unknown_start_validated_count: Default::default(),
+            unknown_start_invalid_count: Default::default(),
+            held_batch_emitted_count: Default::default(),
+            known_start_invalid_count: Default::default(),
+            block_marker_count: Default::default(),
+            batch_walk_ns: Default::default(),
+            batch_walk_count: Default::default(),
             agg_received_cumulative: Default::default(),
             agg_success_forward_cumulative: Default::default(),
             agg_fail_forward_cumulative: Default::default(),
@@ -657,6 +703,53 @@ impl ShredMetrics {
                     "unknown_start_position_error_count",
                     self.unknown_start_position_error_count
                         .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "unknown_start_mid_fec_count",
+                    self.unknown_start_mid_fec_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "unknown_start_retry_skipped_count",
+                    self.unknown_start_retry_skipped_count
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "unknown_start_validated_count",
+                    self.unknown_start_validated_count
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "unknown_start_invalid_count",
+                    self.unknown_start_invalid_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "held_batch_emitted_count",
+                    self.held_batch_emitted_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "known_start_invalid_count",
+                    self.known_start_invalid_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "block_marker_count",
+                    self.block_marker_count.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "batch_walk_ns",
+                    self.batch_walk_ns.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "batch_walk_count",
+                    self.batch_walk_count.swap(0, Ordering::Relaxed),
                     i64
                 ),
             );
