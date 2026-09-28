@@ -57,13 +57,18 @@ pub fn start_forwarder_threads(
     bench_handle: Option<crate::benchmark::BenchmarkHandle>,
     bench_kernel_timestamps: bool,
     pipeline_handle: Option<crate::benchmark::PipelineLatencyHandle>,
+    lean_ingest: Option<crate::lean_ingest::LeanIngestConfig>,
     shutdown_receiver: Receiver<()>,
     exit: Arc<AtomicBool>,
 ) -> Vec<JoinHandle<()>> {
-    let num_threads = num_threads
-        .unwrap_or_else(|| usize::from(std::thread::available_parallelism().unwrap()).min(4));
-
-    let recycler: PacketBatchRecycler = Recycler::warmed(100, 1024);
+    // Lean ingest polls one unicast socket (SO_REUSEPORT would only spread one source's
+    // flow-hashed traffic over idle sockets anyway).
+    let num_threads = if lean_ingest.is_some() {
+        1
+    } else {
+        num_threads
+            .unwrap_or_else(|| usize::from(std::thread::available_parallelism().unwrap()).min(4))
+    };
 
     // multi_bind_in_range returns (port, Vec<UdpSocket>)
     let (_port, sockets) = solana_net_utils::multi_bind_in_range_with_config(
@@ -82,6 +87,30 @@ pub fn start_forwarder_threads(
     // to `SourceId::DoubleZero` (by ingress) rather than by packet source IP.
     let n_unicast_sockets = sockets.len();
 
+    if let Some(config) = lean_ingest {
+        return crate::lean_ingest::start_lean_ingest_threads(
+            config,
+            sockets
+                .into_iter()
+                .chain(maybe_multicast_socket.into_iter().flatten())
+                .collect(),
+            n_unicast_sockets,
+            unioned_dest_sockets,
+            deduper,
+            should_reconstruct_shreds,
+            entry_sender,
+            debug_trace_shred,
+            forward_stats,
+            metrics,
+            shmem_ring_path,
+            bench_handle,
+            bench_kernel_timestamps,
+            pipeline_handle,
+            exit,
+        );
+    }
+
+    let recycler: PacketBatchRecycler = Recycler::warmed(100, 1024);
     let (reconstruct_tx, reconstruct_rx) = crossbeam_channel::bounded::<PacketBatch>(1_024);
     let mut thread_hdls = Vec::with_capacity(num_threads + 1);
 
@@ -344,7 +373,7 @@ impl Reconstructor {
 /// Broadcasts the same packet to multiple recipients, parses it into a Shred if possible,
 /// and stores that shred in `all_shreds`.
 #[allow(clippy::too_many_arguments)]
-fn recv_from_channel_and_send_multiple_dest(
+pub(crate) fn recv_from_channel_and_send_multiple_dest(
     maybe_packet_batch: Result<PacketBatch, RecvError>,
     deduper: &RwLock<Deduper<2, [u8]>>,
     send_socket: &UdpSocket,
@@ -604,6 +633,8 @@ pub struct ShredMetrics {
     pub fail_forward: AtomicU64,
     /// Number of duplicate shreds received
     pub duplicate: AtomicU64,
+    /// Packets not forwarded because the lean ingest forward queue was full
+    pub forward_queue_dropped: AtomicU64,
     /// (discarded, not discarded, from other shredstream instances)
     pub packets_received: DashMap<IpAddr, (u64, u64)>,
 
@@ -665,6 +696,7 @@ impl ShredMetrics {
             success_forward: Default::default(),
             fail_forward: Default::default(),
             duplicate: Default::default(),
+            forward_queue_dropped: Default::default(),
             packets_received: DashMap::with_capacity(10),
             recovered_count: Default::default(),
             recovered_batch_count: Default::default(),
@@ -705,6 +737,11 @@ impl ShredMetrics {
                 i64
             ),
             ("duplicate", self.duplicate.load(Ordering::Relaxed), i64),
+            (
+                "forward_queue_dropped",
+                self.forward_queue_dropped.swap(0, Ordering::Relaxed),
+                i64
+            ),
         );
 
         if self.enabled_grpc_service {

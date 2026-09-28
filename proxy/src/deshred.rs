@@ -1585,7 +1585,7 @@ mod get_indexes_tests {
 /// of real mainnet legacy/v0/v1 transactions, and packets are delivered out of order or
 /// with gaps.
 #[cfg(test)]
-mod validated_start_tests {
+pub(crate) mod validated_start_tests {
     use std::{
         collections::HashSet,
         sync::{
@@ -1606,7 +1606,7 @@ mod validated_start_tests {
         forwarder::ShredMetrics,
     };
 
-    const SLOT: Slot = 1_000;
+    pub(crate) const SLOT: Slot = 1_000;
 
     type AllShreds = ahash::HashMap<
         Slot,
@@ -1617,7 +1617,7 @@ mod validated_start_tests {
     >;
 
     /// A leader that shreds raw payloads into consecutive chained merkle batches.
-    struct Leader {
+    pub(crate) struct Leader {
         keypair: Keypair,
         pool: rayon::ThreadPool,
         rs_cache: ReedSolomonCache,
@@ -1626,7 +1626,7 @@ mod validated_start_tests {
     }
 
     impl Leader {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 keypair: Keypair::new(),
                 pool: rayon::ThreadPoolBuilder::new()
@@ -1659,7 +1659,7 @@ mod validated_start_tests {
         }
 
         /// Data bytes one full 32-data-shred FEC set carries.
-        fn fec_set_payload_bytes(&self) -> usize {
+        pub(crate) fn fec_set_payload_bytes(&self) -> usize {
             let shreds = self.shred(&vec![1u8; 200_000], 0, 0);
             let first = shreds
                 .iter()
@@ -1669,7 +1669,7 @@ mod validated_start_tests {
         }
 
         /// Shred the next batch of the slot.
-        fn batch(&mut self, payload: &[u8]) -> Vec<merkle::Shred> {
+        pub(crate) fn batch(&mut self, payload: &[u8]) -> Vec<merkle::Shred> {
             let shreds = self.shred(payload, self.next_data, self.next_code);
             for s in &shreds {
                 let next = match s.shred_type() {
@@ -1705,7 +1705,7 @@ mod validated_start_tests {
 
     /// A `Vec<Entry>` of exactly `len` bytes cycling through the real transactions (plus
     /// `extra`), each entry holding up to 7 transactions, with one filler transaction last.
-    fn payload_of_len(len: usize, extra: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn payload_of_len(len: usize, extra: &[Vec<u8>]) -> Vec<u8> {
         let real = real_transactions();
         let pool: Vec<&[u8]> = real
             .iter()

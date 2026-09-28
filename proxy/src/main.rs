@@ -39,6 +39,7 @@ mod deshred;
 mod entry_walk;
 pub mod forwarder;
 mod heartbeat;
+mod lean_ingest;
 mod multicast_config;
 mod server;
 pub mod shmem_ring;
@@ -153,9 +154,19 @@ struct CommonArgs {
     #[arg(long, env)]
     public_ip: Option<IpAddr>,
 
-    /// Number of threads to use. Defaults to use up to 4.
+    /// Number of threads to use. Defaults to use up to 4. Ignored with --lean-ingest.
     #[arg(long, env)]
     num_threads: Option<usize>,
+
+    /// Run receive -> FEC recovery -> deshred -> shmem publish to completion on one
+    /// busy-polling thread, with UDP forwarding on its own thread (see lean_ingest.rs).
+    /// The thread spins at 100% of a core; pin it with --lean-ingest-core.
+    #[arg(long, env, default_value_t = false)]
+    lean_ingest: bool,
+
+    /// Core to pin the --lean-ingest thread to (Linux). Startup fails if pinning fails.
+    #[arg(long, env, requires = "lean_ingest")]
+    lean_ingest_core: Option<usize>,
 }
 
 #[derive(Debug, Error)]
@@ -343,6 +354,9 @@ fn main() -> Result<(), ShredstreamProxyError> {
         bench_handle,
         bench_kernel_timestamps,
         bench_pipeline_handle,
+        args.lean_ingest.then_some(lean_ingest::LeanIngestConfig {
+            core: args.lean_ingest_core,
+        }),
         shutdown_receiver.clone(),
         exit.clone(),
     );
