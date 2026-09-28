@@ -273,13 +273,15 @@ impl ShmemRingConsumer {
 
         // Validate header
         let header = unsafe { &*(mmap_ptr as *const RingHeader) };
-        if header.magic != MAGIC {
+        let magic = header.magic;
+        if magic != MAGIC {
+            // `header` points into the mapping: read everything needed before unmapping.
             unsafe {
                 libc::munmap(mmap_ptr as *mut libc::c_void, file_len);
             }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid magic: expected {:#x}, got {:#x}", MAGIC, header.magic),
+                format!("invalid magic: expected {:#x}, got {:#x}", MAGIC, magic),
             ));
         }
 
@@ -396,6 +398,19 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("shmem_ring_test_{}_{}", std::process::id(), id));
         path
+    }
+
+    #[test]
+    fn open_rejects_bad_magic_without_touching_the_unmapped_header() {
+        // A file that exists but is not (yet) a ring, as seen while a producer is still
+        // initializing one. Opening it used to read the header after munmap (SIGSEGV).
+        let path = temp_path();
+        std::fs::write(&path, vec![0u8; HEADER_SIZE + 4096]).unwrap();
+        let err = ShmemRingConsumer::open(&path)
+            .err()
+            .expect("bad magic must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
