@@ -56,7 +56,9 @@ use crate::{
 
 /// Receive calls (not packets) the forwarding thread may lag behind before copies are
 /// dropped from forwarding (counted in `forward_queue_dropped`). Deshred is unaffected.
-const FORWARD_QUEUE_CAPACITY: usize = 8_192;
+/// Same bound as the default path's reconstruct channel: at most 1024 x 64 packets
+/// (~85 MB) if the forwarder stalls during a burst, ~100 ms of backlog at typical rates.
+const FORWARD_QUEUE_CAPACITY: usize = 1_024;
 /// Longest the forwarding thread sleeps when the ingest thread has nothing for it; it is
 /// woken explicitly as soon as there is.
 const FORWARD_IDLE_PARK: Duration = Duration::from_millis(1);
@@ -97,6 +99,7 @@ pub fn start_lean_ingest_threads(
             }
         }
     }
+    let n_sockets = sockets.len();
     let (forward_tx, forward_rx) = crossbeam_channel::bounded(FORWARD_QUEUE_CAPACITY);
 
     let forward_hdl = {
@@ -154,8 +157,7 @@ pub fn start_lean_ingest_threads(
         .unwrap();
 
     info!(
-        "Lean ingest started on {} socket(s){}",
-        n_unicast_sockets,
+        "Lean ingest started on {n_sockets} socket(s) ({n_unicast_sockets} unicast){}",
         config
             .core
             .map(|c| format!(", pinned to core {c}"))
