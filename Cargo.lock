@@ -2783,6 +2783,7 @@ dependencies = [
  "prost 0.13.5",
  "prost-types 0.13.5",
  "rand 0.8.5",
+ "rayon",
  "reqwest 0.12.15",
  "serde",
  "serde_json",

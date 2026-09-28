@@ -890,6 +890,7 @@ mod tests {
                 .sum::<usize>(),
             13580
         );
+        assert_all_batches_walk(&deshredded_entries);
         assert_eq!(all_shreds.len(), 30);
 
         let slot_to_entry = deshredded_entries
@@ -952,12 +953,148 @@ mod tests {
                 .sum::<usize>(),
             13580
         );
+        assert_all_batches_walk(&deshredded_entries);
         assert!(all_shreds.len() > 15);
 
         let slot_to_entry = deshredded_entries
             .iter()
             .into_group_map_by(|(slot, _entries_bytes)| *slot);
         assert_eq!(slot_to_entry.len(), 29);
+    }
+
+    /// Every emitted batch passes the structural walk, which agrees with bincode on the
+    /// entry and transaction counts.
+    fn assert_all_batches_walk(deshredded_entries: &[(Slot, Vec<u8>)]) {
+        for (slot, bytes) in deshredded_entries {
+            let entries = bincode::deserialize::<Vec<solana_entry::entry::Entry>>(bytes).unwrap();
+            let transactions = entries.iter().map(|e| e.transactions.len() as u64).sum();
+            let walked = crate::entry_walk::validate_batch(bytes)
+                .unwrap_or_else(|e| panic!("slot {slot}: {e}"));
+            if entries.is_empty() {
+                assert_eq!(walked, crate::entry_walk::BatchKind::Empty, "slot {slot}");
+            } else {
+                assert_eq!(
+                    walked,
+                    crate::entry_walk::BatchKind::Entries {
+                        entries: entries.len() as u64,
+                        transactions
+                    },
+                    "slot {slot}"
+                );
+            }
+        }
+    }
+
+    /// Timing only:
+    /// `cargo test --release -p jito-shredstream-proxy bench_batch_walk -- --ignored --nocapture`.
+    /// Walk cost on every batch deshredded from the captured mainnet shreds, next to the
+    /// deshred concatenation that precedes it and the bincode decode `caa9daf` removed.
+    #[test]
+    #[ignore = "timing only; run with --ignored --nocapture"]
+    fn bench_batch_walk() {
+        use std::{hint::black_box, time::Instant};
+
+        let packets = {
+            let mut file = std::fs::File::open("../bins/serialized_shreds.bin").unwrap();
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer).unwrap();
+            Packets::try_from_slice(&buffer).unwrap()
+        };
+        let mut all_shreds = ahash::HashMap::default();
+        let mut deshredded_entries = Vec::new();
+        reconstruct_shreds(
+            PacketBatch::new(
+                packets
+                    .packets
+                    .iter()
+                    .map(|x| {
+                        let mut packet = Packet::default();
+                        packet.buffer_mut()[..x.len()].copy_from_slice(x);
+                        packet.meta_mut().size = x.len();
+                        packet
+                    })
+                    .collect_vec(),
+            ),
+            &mut all_shreds,
+            &mut Vec::new(),
+            &mut deshredded_entries,
+            &mut Vec::new(),
+            &mut 0,
+            &ReedSolomonCache::default(),
+            &ShredMetrics::default(),
+        );
+        let batches: Vec<&[u8]> = deshredded_entries
+            .iter()
+            .map(|(_, b)| b.as_slice())
+            .collect();
+        let total_bytes: usize = batches.iter().map(|b| b.len()).sum();
+        let total_txs: u64 = batches
+            .iter()
+            .map(|b| match crate::entry_walk::validate_batch(b).unwrap() {
+                crate::entry_walk::BatchKind::Entries { transactions, .. } => transactions,
+                _ => 0,
+            })
+            .sum();
+        let time_per_pass = |f: &dyn Fn()| {
+            for _ in 0..3 {
+                f();
+            }
+            let passes = 30u32;
+            let start = Instant::now();
+            for _ in 0..passes {
+                f();
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(passes)
+        };
+        let walk_ns = time_per_pass(&|| {
+            for b in &batches {
+                black_box(crate::entry_walk::validate_batch(black_box(b)).unwrap());
+            }
+        });
+        let bincode_ns = time_per_pass(&|| {
+            for b in &batches {
+                black_box(
+                    bincode::deserialize::<Vec<solana_entry::entry::Entry>>(black_box(b)).unwrap(),
+                );
+            }
+        });
+        let per_kb = |ns: f64| ns / (total_bytes as f64 / 1024.0);
+        println!(
+            "{} batches, {} txs, {:.1} KB mean batch: walk {:.2} us/batch = {:.1} ns/KB \
+             (= {:.2} us per 60 KB); bincode Vec<Entry> {:.2} us/batch = {:.1} ns/KB",
+            batches.len(),
+            total_txs,
+            total_bytes as f64 / batches.len() as f64 / 1024.0,
+            walk_ns / batches.len() as f64 / 1000.0,
+            per_kb(walk_ns),
+            per_kb(walk_ns) * 60.0 / 1000.0,
+            bincode_ns / batches.len() as f64 / 1000.0,
+            per_kb(bincode_ns),
+        );
+
+        // A current-format 2-FEC-set batch (61,632 bytes) of real legacy/v0/v1 txs.
+        let [legacy, v0, v1_small, v1_large] =
+            crate::entry_walk::test_fixtures::real_transactions();
+        let cycle: Vec<&[u8]> = vec![&legacy, &v0, &legacy, &v1_small, &legacy, &v0, &v1_large];
+        let mut txs: Vec<&[u8]> = vec![];
+        let mut len = 8 + 48;
+        while len < 61_632 - 2_000 {
+            let tx = cycle[txs.len() % cycle.len()];
+            txs.push(tx);
+            len += tx.len();
+        }
+        let mut modern = crate::entry_walk::test_fixtures::batch_of(&[(1, [1; 32], &txs)]);
+        modern.resize(61_632, 0); // Firedancer-style zero padding to two FEC sets
+        let modern_ns = time_per_pass(&|| {
+            for _ in 0..100 {
+                black_box(crate::entry_walk::validate_batch(black_box(&modern)).unwrap());
+            }
+        }) / 100.0;
+        println!(
+            "61,632-byte legacy/v0/v1 batch ({} txs, zero padded): walk {:.2} us",
+            txs.len(),
+            modern_ns / 1000.0
+        );
     }
 
     /// Helper function to compare all shred output
@@ -1080,6 +1217,7 @@ mod tests {
                 .sum::<usize>(),
             43170
         );
+        assert_all_batches_walk(&deshredded_entries);
         assert_eq!(all_shreds.len(), 61);
 
         let slot_to_entry = deshredded_entries
@@ -1142,6 +1280,7 @@ mod tests {
                 .sum::<usize>(),
             43170
         );
+        assert_all_batches_walk(&deshredded_entries);
         assert!(all_shreds.len() > 15);
 
         let slot_to_entry = deshredded_entries
@@ -1401,3 +1540,490 @@ mod get_indexes_tests {
     }
 }
 
+/// End-to-end unknown-start behaviour on real merkle shreds: a leader shreds payloads made
+/// of real mainnet legacy/v0/v1 transactions, and packets are delivered out of order or
+/// with gaps.
+#[cfg(test)]
+mod validated_start_tests {
+    use std::{
+        collections::HashSet,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+    };
+
+    use solana_ledger::shred::{layout, merkle, ProcessShredsStats, ReedSolomonCache, ShredType};
+    use solana_perf::packet::{Packet, PacketBatch};
+    use solana_sdk::{clock::Slot, hash::Hash, signature::Keypair};
+
+    use super::{
+        observe_known_start_batch, reconstruct_shreds, ComparableShred, ShredsStateTracker,
+    };
+    use crate::{
+        entry_walk::{self, test_fixtures::*, BatchKind},
+        forwarder::ShredMetrics,
+    };
+
+    const SLOT: Slot = 1_000;
+
+    type AllShreds = ahash::HashMap<
+        Slot,
+        (
+            ahash::HashMap<u32, HashSet<ComparableShred>>,
+            ShredsStateTracker,
+        ),
+    >;
+
+    /// A leader that shreds raw payloads into consecutive chained merkle batches.
+    struct Leader {
+        keypair: Keypair,
+        pool: rayon::ThreadPool,
+        rs_cache: ReedSolomonCache,
+        next_data: u32,
+        next_code: u32,
+    }
+
+    impl Leader {
+        fn new() -> Self {
+            Self {
+                keypair: Keypair::new(),
+                pool: rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .build()
+                    .unwrap(),
+                rs_cache: ReedSolomonCache::default(),
+                next_data: 0,
+                next_code: 0,
+            }
+        }
+
+        fn shred(&self, payload: &[u8], next_data: u32, next_code: u32) -> Vec<merkle::Shred> {
+            merkle::make_shreds_from_data(
+                &self.pool,
+                &self.keypair,
+                Some(Hash::new_from_array([7; 32])),
+                payload,
+                SLOT,
+                SLOT - 1,
+                0, // shred_version
+                0, // reference_tick
+                false,
+                next_data,
+                next_code,
+                &self.rs_cache,
+                &mut ProcessShredsStats::default(),
+            )
+            .unwrap()
+        }
+
+        /// Data bytes one full 32-data-shred FEC set carries.
+        fn fec_set_payload_bytes(&self) -> usize {
+            let shreds = self.shred(&vec![1u8; 200_000], 0, 0);
+            let first = shreds
+                .iter()
+                .find(|s| s.shred_type() == ShredType::Data)
+                .unwrap();
+            32 * layout::get_data(first.payload().as_ref()).unwrap().len()
+        }
+
+        /// Shred the next batch of the slot.
+        fn batch(&mut self, payload: &[u8]) -> Vec<merkle::Shred> {
+            let shreds = self.shred(payload, self.next_data, self.next_code);
+            for s in &shreds {
+                let next = match s.shred_type() {
+                    ShredType::Data => &mut self.next_data,
+                    ShredType::Code => &mut self.next_code,
+                };
+                *next = (*next).max(s.index() + 1);
+            }
+            shreds
+        }
+    }
+
+    /// A legacy transaction padding a batch to an exact length (300..=16_000 bytes).
+    fn filler_tx(len: usize) -> Vec<u8> {
+        // sig count, sig, header, key count, 2 keys, blockhash, ix count, program index,
+        // account count, 1 account index, then a 2-byte ShortU16 data length and the data.
+        const FIXED: usize = 1 + 64 + 3 + 1 + 64 + 32 + 1 + 1 + 1 + 1;
+        let data_len = len - FIXED - 2;
+        assert!((128..16_384).contains(&data_len));
+        let mut tx = vec![1u8];
+        tx.extend_from_slice(&[0x5a; 64]);
+        tx.extend_from_slice(&[1, 0, 1, 2]);
+        tx.extend_from_slice(&[0x11; 32]);
+        tx.extend_from_slice(&[0x22; 32]);
+        tx.extend_from_slice(&[0x33; 32]);
+        tx.extend_from_slice(&[1, 1, 1, 0]);
+        tx.push((data_len & 0x7f) as u8 | 0x80);
+        tx.push((data_len >> 7) as u8);
+        tx.extend(std::iter::repeat_n(0x44, data_len));
+        assert_eq!(tx.len(), len);
+        tx
+    }
+
+    /// A `Vec<Entry>` of exactly `len` bytes cycling through the real transactions (plus
+    /// `extra`), each entry holding up to 7 transactions, with one filler transaction last.
+    fn payload_of_len(len: usize, extra: &[Vec<u8>]) -> Vec<u8> {
+        let real = real_transactions();
+        let pool: Vec<&[u8]> = real
+            .iter()
+            .chain(extra.iter())
+            .map(|t| t.as_slice())
+            .collect();
+        let mut entries: Vec<Vec<&[u8]>> = vec![];
+        let mut total = 8usize;
+        let mut i = 0;
+        loop {
+            let tx = pool[i % pool.len()];
+            let new_entry = entries.last().is_none_or(|e| e.len() == 7);
+            let cost = tx.len() + if new_entry { 48 } else { 0 };
+            // Leave room for a last entry holding one 300..=16_000-byte filler.
+            if total + cost + 48 + 300 > len {
+                break;
+            }
+            if new_entry {
+                entries.push(vec![]);
+            }
+            entries.last_mut().unwrap().push(tx);
+            total += cost;
+            i += 1;
+        }
+        let filler = filler_tx(len - total - 48);
+        entries.push(vec![&filler]);
+        let hashes: Vec<[u8; 32]> = (0..entries.len()).map(|k| [k as u8; 32]).collect();
+        let spec: Vec<EntrySpec> = entries
+            .iter()
+            .zip(&hashes)
+            .map(|(txs, h)| (1u64, *h, txs.as_slice()))
+            .collect();
+        let bytes = batch_of(&spec);
+        assert_eq!(bytes.len(), len);
+        assert!(entry_walk::validate_batch(&bytes).is_ok());
+        bytes
+    }
+
+    fn packets<'a>(shreds: impl IntoIterator<Item = &'a merkle::Shred>) -> PacketBatch {
+        PacketBatch::new(
+            shreds
+                .into_iter()
+                .map(|s| {
+                    let bytes: &[u8] = s.payload().as_ref();
+                    let mut p = Packet::default();
+                    p.buffer_mut()[..bytes.len()].copy_from_slice(bytes);
+                    p.meta_mut().size = bytes.len();
+                    p
+                })
+                .collect(),
+        )
+    }
+
+    struct Proxy {
+        all_shreds: AllShreds,
+        scratch: Vec<(Slot, u32)>,
+        highest_slot_seen: Slot,
+        rs_cache: ReedSolomonCache,
+        metrics: Arc<ShredMetrics>,
+    }
+
+    /// One emitted batch: (payload, start index, end index, unknown_start).
+    type Emitted = (Vec<u8>, u32, u32, bool);
+
+    impl Proxy {
+        fn new() -> Self {
+            Self {
+                all_shreds: AllShreds::default(),
+                scratch: vec![],
+                highest_slot_seen: 0,
+                rs_cache: ReedSolomonCache::default(),
+                metrics: Arc::new(ShredMetrics::default()),
+            }
+        }
+
+        /// Feed one packet batch; returns what was emitted, running the known-start walk
+        /// exactly as the reconstruct thread does after publishing.
+        fn feed<'a>(
+            &mut self,
+            shreds: impl IntoIterator<Item = &'a merkle::Shred>,
+        ) -> Vec<Emitted> {
+            let mut entries = vec![];
+            let mut ranges = vec![];
+            reconstruct_shreds(
+                packets(shreds),
+                &mut self.all_shreds,
+                &mut self.scratch,
+                &mut entries,
+                &mut ranges,
+                &mut self.highest_slot_seen,
+                &self.rs_cache,
+                &self.metrics,
+            );
+            entries
+                .into_iter()
+                .zip(ranges)
+                .map(|((slot, bytes), (start, end, unknown_start))| {
+                    assert_eq!(slot, SLOT);
+                    if !unknown_start {
+                        observe_known_start_batch(slot, start, end, &bytes, &self.metrics);
+                    }
+                    (bytes, start, end, unknown_start)
+                })
+                .collect()
+        }
+    }
+
+    fn count(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+
+    fn is_data(s: &merkle::Shred) -> bool {
+        s.shred_type() == ShredType::Data
+    }
+
+    /// Z = 1 FEC set (data 0..=31), A = 2 FEC sets (32..=95), B = 1 FEC set (96..=127).
+    struct Slot3 {
+        z: Vec<u8>,
+        a: Vec<u8>,
+        b: Vec<u8>,
+        shreds: Vec<merkle::Shred>,
+    }
+
+    fn three_batches(a_extra: &[Vec<u8>]) -> Slot3 {
+        let mut leader = Leader::new();
+        let set = leader.fec_set_payload_bytes();
+        let z = payload_of_len(set, &[]);
+        let a = payload_of_len(2 * set, a_extra);
+        let b = payload_of_len(set, &[]);
+        let mut shreds = leader.batch(&z);
+        shreds.extend(leader.batch(&a));
+        shreds.extend(leader.batch(&b));
+        // Every set is a full 32:32 set, as on mainnet.
+        let fec_sets: Vec<u32> = shreds
+            .iter()
+            .filter(|s| is_data(s))
+            .map(|s| s.fec_set_index())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(fec_sets, vec![0, 32, 64, 96]);
+        Slot3 { z, a, b, shreds }
+    }
+
+    #[test]
+    fn known_starts_emit_every_batch_once_and_validate() {
+        let s = three_batches(&[]);
+        let mut proxy = Proxy::new();
+        let out = proxy.feed(&s.shreds);
+        let got: Vec<_> = out
+            .iter()
+            .map(|(b, st, en, u)| (b.clone(), *st, *en, *u))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (s.z.clone(), 0, 31, false),
+                (s.a.clone(), 32, 95, false),
+                (s.b.clone(), 96, 127, false),
+            ]
+        );
+        let m = proxy.metrics.clone();
+        assert_eq!(count(&m.known_start_invalid_count), 0);
+        assert_eq!(count(&m.batch_walk_count), 3);
+        assert_eq!(count(&m.unknown_start_position_count), 0);
+        // Real transactions (4 per cycle) plus one filler per batch were counted.
+        assert!(count(&m.txn_count) > 3 * 20);
+    }
+
+    #[test]
+    fn wrong_guess_is_rejected_then_the_whole_batch_is_emitted() {
+        let s = three_batches(&[]);
+        // Lose data shred 63 (last of A's first set) and all of that set's coding shreds,
+        // and hold back the coding shreds of A's second set for a later packet batch.
+        let first = s.shreds.iter().filter(|x| {
+            let lost = is_data(x) && x.index() == 63;
+            let set32_code = !is_data(x) && x.fec_set_index() == 32;
+            let set64_code = !is_data(x) && x.fec_set_index() == 64;
+            !(lost || set32_code || set64_code)
+        });
+        let mut proxy = Proxy::new();
+        let out = proxy.feed(first);
+        // Z and B have proven starts; A's second set alone was guessed and rejected.
+        let got: Vec<_> = out.iter().map(|(_, st, en, u)| (*st, *en, *u)).collect();
+        assert_eq!(got, vec![(0, 31, false), (96, 127, false)]);
+        let m = proxy.metrics.clone();
+        assert_eq!(count(&m.unknown_start_position_count), 1);
+        assert_eq!(count(&m.unknown_start_invalid_count), 1);
+        assert_eq!(count(&m.unknown_start_validated_count), 0);
+
+        // More shreds of the held set: the same guess is not deshredded again.
+        let out = proxy.feed(
+            s.shreds
+                .iter()
+                .filter(|x| !is_data(x) && x.fec_set_index() == 64),
+        );
+        assert!(out.is_empty());
+        assert_eq!(count(&m.unknown_start_position_count), 1);
+        assert!(count(&m.unknown_start_retry_skipped_count) >= 1);
+
+        // The missing shred arrives: A is emitted whole, with its proven start.
+        let out = proxy.feed(s.shreds.iter().filter(|x| is_data(x) && x.index() == 63));
+        assert_eq!(out, vec![(s.a.clone(), 32, 95, false)]);
+        assert_eq!(count(&m.held_batch_emitted_count), 1);
+        assert_eq!(count(&m.known_start_invalid_count), 0);
+    }
+
+    #[test]
+    fn right_guess_is_validated_and_emitted_immediately() {
+        let s = three_batches(&[]);
+        // Lose Z's DATA_COMPLETE shred (31) and Z's coding shreds.
+        let mut proxy = Proxy::new();
+        let out = proxy.feed(s.shreds.iter().filter(|x| {
+            !((is_data(x) && x.index() == 31) || (!is_data(x) && x.fec_set_index() == 0))
+        }));
+        assert_eq!(
+            out,
+            vec![(s.a.clone(), 32, 95, true), (s.b.clone(), 96, 127, false)]
+        );
+        let m = proxy.metrics.clone();
+        assert_eq!(count(&m.unknown_start_validated_count), 1);
+        assert_eq!(count(&m.unknown_start_invalid_count), 0);
+
+        // Shred 31 arrives: Z is emitted; A is not emitted twice.
+        let out = proxy.feed(s.shreds.iter().filter(|x| is_data(x) && x.index() == 31));
+        assert_eq!(out, vec![(s.z.clone(), 0, 31, false)]);
+        assert_eq!(count(&m.held_batch_emitted_count), 0);
+    }
+
+    #[test]
+    fn mid_fec_set_guess_is_never_emitted() {
+        let s = three_batches(&[]);
+        // Lose data shred 40 (inside A's first set) and hold back that set's coding.
+        let mut proxy = Proxy::new();
+        let out = proxy.feed(s.shreds.iter().filter(|x| {
+            !((is_data(x) && x.index() == 40) || (!is_data(x) && x.fec_set_index() == 32))
+        }));
+        // The old code emitted 41..=95 as a guessed batch; now only Z and B go out.
+        let got: Vec<_> = out.iter().map(|(_, st, en, u)| (*st, *en, *u)).collect();
+        assert_eq!(got, vec![(0, 31, false), (96, 127, false)]);
+        let m = proxy.metrics.clone();
+        assert!(count(&m.unknown_start_mid_fec_count) >= 1);
+        assert_eq!(count(&m.unknown_start_position_count), 0);
+
+        // The set's coding shreds arrive: FEC recovery fills 40 and A is emitted whole.
+        let out = proxy.feed(
+            s.shreds
+                .iter()
+                .filter(|x| !is_data(x) && x.fec_set_index() == 32),
+        );
+        assert_eq!(out, vec![(s.a.clone(), 32, 95, false)]);
+    }
+
+    #[test]
+    fn unknown_format_batch_held_by_guess_is_released_by_its_proven_start() {
+        // A contains a transaction with an unknown message version (0x82): the walk
+        // rejects it as a guess, but once its start is proven it must still go out.
+        let mut unknown = decode(V0_B64);
+        unknown[65] = 0x82;
+        let s = {
+            let mut leader = Leader::new();
+            let set = leader.fec_set_payload_bytes();
+            let z = payload_of_len(set, &[]);
+            // A = real payload + one more entry holding only the unknown-format tx.
+            let mut a = payload_of_len(2 * set - 48 - unknown.len(), &[]);
+            let n = u64::from_le_bytes(a[..8].try_into().unwrap());
+            a[..8].copy_from_slice(&(n + 1).to_le_bytes());
+            a.extend_from_slice(&1u64.to_le_bytes()); // num_hashes
+            a.extend_from_slice(&[0xcc; 32]); // hash
+            a.extend_from_slice(&1u64.to_le_bytes()); // tx count
+            a.extend_from_slice(&unknown);
+            assert_eq!(a.len(), 2 * set);
+            assert!(entry_walk::validate_batch(&a).is_err());
+            let b = payload_of_len(set, &[]);
+            let mut shreds = leader.batch(&z);
+            shreds.extend(leader.batch(&a));
+            shreds.extend(leader.batch(&b));
+            Slot3 { z, a, b, shreds }
+        };
+        // Lose Z's DATA_COMPLETE shred (31) and Z's coding: A's start is a (right) guess.
+        let mut proxy = Proxy::new();
+        let out = proxy.feed(s.shreds.iter().filter(|x| {
+            !((is_data(x) && x.index() == 31) || (!is_data(x) && x.fec_set_index() == 0))
+        }));
+        assert_eq!(out, vec![(s.b.clone(), 96, 127, false)]);
+        let m = proxy.metrics.clone();
+        assert_eq!(count(&m.unknown_start_invalid_count), 1);
+
+        // Only shred 31 arrives; set 32 is not touched, yet A's now-proven start releases
+        // it, and the post-publish walk flags it.
+        let out = proxy.feed(s.shreds.iter().filter(|x| is_data(x) && x.index() == 31));
+        assert_eq!(
+            out,
+            vec![(s.z.clone(), 0, 31, false), (s.a.clone(), 32, 95, false)]
+        );
+        assert_eq!(count(&m.held_batch_emitted_count), 1);
+        assert_eq!(count(&m.known_start_invalid_count), 1);
+    }
+
+    #[test]
+    fn block_marker_batch_is_emitted_and_does_not_block_later_batches() {
+        let mut leader = Leader::new();
+        let set = leader.fec_set_payload_bytes();
+        let z = payload_of_len(set, &[]);
+        let marker = block_header_marker(SLOT - 1, [9; 32]);
+        let a = payload_of_len(set, &[]);
+        let mut shreds = leader.batch(&z);
+        let marker_shreds = leader.batch(&marker);
+        let marker_start = marker_shreds[0].index();
+        let marker_end = marker_shreds
+            .iter()
+            .filter(|x| is_data(x))
+            .map(|x| x.index())
+            .max()
+            .unwrap();
+        shreds.extend(marker_shreds);
+        shreds.extend(leader.batch(&a));
+        let a_start = marker_end + 1;
+
+        // Everything present: all three batches with proven starts.
+        let mut proxy = Proxy::new();
+        let out = proxy.feed(&shreds);
+        let got: Vec<_> = out
+            .iter()
+            .map(|(b, st, _, u)| (b.clone(), *st, *u))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (z.clone(), 0, false),
+                (marker.clone(), marker_start, false),
+                (a.clone(), a_start, false)
+            ]
+        );
+        assert_eq!(count(&proxy.metrics.block_marker_count), 1);
+        assert_eq!(count(&proxy.metrics.known_start_invalid_count), 0);
+
+        // Z's end lost: the marker's start is a guess, it validates as a marker, and the
+        // batch after it keeps its proven start.
+        let mut proxy = Proxy::new();
+        let out = proxy.feed(shreds.iter().filter(|x| {
+            !((is_data(x) && x.index() == 31) || (!is_data(x) && x.fec_set_index() == 0))
+        }));
+        let got: Vec<_> = out
+            .iter()
+            .map(|(b, st, _, u)| (b.clone(), *st, *u))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (marker.clone(), marker_start, true),
+                (a.clone(), a_start, false)
+            ]
+        );
+        assert_eq!(count(&proxy.metrics.unknown_start_validated_count), 1);
+        assert_eq!(count(&proxy.metrics.block_marker_count), 1);
+        assert_eq!(
+            entry_walk::validate_batch(&marker),
+            Ok(BatchKind::BlockMarker { variant: 1 })
+        );
+    }
+}
